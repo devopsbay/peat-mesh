@@ -68,6 +68,10 @@ pub enum SyncError {
     /// Circuit breaker open (too many failures)
     #[error("Circuit breaker open for peer")]
     CircuitBreakerOpen,
+
+    /// Bandwidth quota exhausted for the given QoS class
+    #[error("Bandwidth exhausted for class {0}")]
+    BandwidthExhausted(String),
 }
 
 /// Error severity levels for prioritization
@@ -95,6 +99,7 @@ impl SyncError {
             SyncError::State(_) => ErrorSeverity::Severe,
             SyncError::ResourceExhaustion(_) => ErrorSeverity::Severe,
             SyncError::CircuitBreakerOpen => ErrorSeverity::Transient,
+            SyncError::BandwidthExhausted(_) => ErrorSeverity::Transient,
         }
     }
 

@@ -483,6 +483,12 @@ pub struct PeerSyncStats {
     pub last_sync: Option<SystemTime>,
     /// Number of sync failures
     pub failure_count: u64,
+    /// Count of LatestOnly mode syncs
+    pub latest_only_count: u64,
+    /// Count of FullHistory mode syncs
+    pub full_history_count: u64,
+    /// Count of WindowedHistory mode syncs
+    pub windowed_count: u64,
 }
 
 /// Coordinator for Automerge document synchronization over Iroh
@@ -533,6 +539,8 @@ pub struct AutomergeSyncCoordinator {
     negentropy_sync: Arc<NegentropySync>,
     /// Optional TTL manager for automatic document expiration
     ttl_manager: Arc<RwLock<Option<Arc<super::ttl_manager::TtlManager>>>>,
+    /// Optional bandwidth allocation for QoS-aware sync (PRD-004)
+    bandwidth_allocation: Arc<RwLock<Option<Arc<crate::qos::BandwidthAllocation>>>>,
 }
 
 #[cfg(feature = "automerge-backend")]
@@ -575,6 +583,7 @@ impl AutomergeSyncCoordinator {
             channel_manager: Arc::new(RwLock::new(None)),
             negentropy_sync: Arc::new(NegentropySync::new()),
             ttl_manager: Arc::new(RwLock::new(None)),
+            bandwidth_allocation: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -606,6 +615,7 @@ impl AutomergeSyncCoordinator {
             channel_manager: Arc::new(RwLock::new(None)),
             negentropy_sync: Arc::new(NegentropySync::new()),
             ttl_manager: Arc::new(RwLock::new(None)),
+            bandwidth_allocation: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -623,6 +633,14 @@ impl AutomergeSyncCoordinator {
     /// Set the TTL manager for automatic document expiration on synced documents
     pub fn set_ttl_manager(&self, manager: Arc<super::ttl_manager::TtlManager>) {
         *self.ttl_manager.write().unwrap_or_else(|e| e.into_inner()) = Some(manager);
+    }
+
+    /// Set the bandwidth allocation for QoS-aware sync (PRD-004)
+    pub fn set_bandwidth_allocation(&self, allocation: Arc<crate::qos::BandwidthAllocation>) {
+        *self
+            .bandwidth_allocation
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(allocation);
     }
 
     /// Put a document into the store, applying TTL if a TTL manager is configured.
@@ -683,6 +701,7 @@ impl AutomergeSyncCoordinator {
             channel_manager: Arc::new(RwLock::new(None)),
             negentropy_sync: Arc::new(NegentropySync::new()),
             ttl_manager: Arc::new(RwLock::new(None)),
+            bandwidth_allocation: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -820,7 +839,27 @@ impl AutomergeSyncCoordinator {
         let doc_bytes = doc.save();
         tracing::debug!("initiate_sync_inner: got doc, len={}", doc_bytes.len());
 
-        // Use appropriate sync method based on mode
+        // Acquire bandwidth permit if allocation is configured (PRD-004)
+        if let Some(alloc) = self
+            .bandwidth_allocation
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let collection = Self::collection_from_doc_key(doc_key);
+            let qos_class = crate::qos::QoSClass::for_collection(collection);
+            if alloc.acquire(qos_class, doc_bytes.len()).is_none() {
+                tracing::debug!(
+                    doc_key = doc_key,
+                    class = %qos_class,
+                    size = doc_bytes.len(),
+                    "Bandwidth exhausted, deferring sync"
+                );
+                return Err(anyhow::anyhow!("Bandwidth exhausted for {}", qos_class));
+            }
+        }
+
+        // Use appropriate sync method based on mode and track per-mode metrics
         match sync_mode {
             SyncMode::LatestOnly => {
                 // Issue #355: Send full document state instead of delta sync
@@ -831,13 +870,37 @@ impl AutomergeSyncCoordinator {
                 );
                 self.send_state_snapshot(peer_id, doc_key, &doc_bytes)
                     .await?;
-                tracing::debug!("initiate_sync_inner: state snapshot sent successfully");
+                {
+                    let mut stats = self.peer_stats.write().unwrap_or_else(|e| e.into_inner());
+                    stats.entry(peer_id).or_default().latest_only_count += 1;
+                }
                 Ok(())
             }
-            SyncMode::FullHistory | SyncMode::WindowedHistory { .. } => {
+            SyncMode::WindowedHistory { .. } => {
+                // WindowedHistory: send current state snapshot (like LatestOnly) since
+                // Automerge doesn't natively support time-filtered deltas. The key
+                // difference from FullHistory is that we skip expensive delta computation
+                // and just send the current document state.
+                tracing::debug!(
+                    "initiate_sync_inner: using WindowedHistory mode, sending {} bytes state snapshot",
+                    doc_bytes.len()
+                );
+                self.send_state_snapshot(peer_id, doc_key, &doc_bytes)
+                    .await?;
+                {
+                    let mut stats = self.peer_stats.write().unwrap_or_else(|e| e.into_inner());
+                    stats.entry(peer_id).or_default().windowed_count += 1;
+                }
+                Ok(())
+            }
+            SyncMode::FullHistory => {
                 // Traditional delta-based sync
-                // WindowedHistory uses same path but receiver will filter (Phase 2)
-                self.initiate_delta_sync(doc_key, peer_id, &doc).await
+                let result = self.initiate_delta_sync(doc_key, peer_id, &doc).await;
+                {
+                    let mut stats = self.peer_stats.write().unwrap_or_else(|e| e.into_inner());
+                    stats.entry(peer_id).or_default().full_history_count += 1;
+                }
+                result
             }
         }
     }
@@ -1463,7 +1526,23 @@ impl AutomergeSyncCoordinator {
             peer_id
         );
 
-        for (doc_key, _doc) in all_docs {
+        // Sort documents by QoS priority (Critical first, Bulk last) then by sync mode
+        // (LatestOnly before FullHistory within same priority). This ensures mission-critical
+        // data syncs first, and fast state-snapshot syncs run before expensive delta syncs.
+        let mut doc_keys: Vec<String> = all_docs.into_iter().map(|(key, _)| key).collect();
+        doc_keys.sort_by_key(|key| {
+            let collection = Self::collection_from_doc_key(key);
+            let qos_class = crate::qos::QoSClass::for_collection(collection);
+            let mode = self.sync_mode_for_doc(key);
+            let mode_order = match mode {
+                SyncMode::LatestOnly | SyncMode::WindowedHistory { .. } => 0u8,
+                SyncMode::FullHistory => 1u8,
+            };
+            // Primary: QoS class (Critical=1 first), Secondary: sync mode (fast first)
+            (qos_class.as_u8(), mode_order)
+        });
+
+        for doc_key in doc_keys {
             if let Err(e) = self.sync_document_with_peer(&doc_key, peer_id).await {
                 tracing::warn!(
                     "Failed to sync document {} with new peer {:?}: {}",
@@ -1511,12 +1590,13 @@ impl AutomergeSyncCoordinator {
             let sync_mode = self.sync_mode_for_doc(doc_key);
 
             match sync_mode {
-                SyncMode::LatestOnly => {
-                    // State snapshot
+                SyncMode::LatestOnly | SyncMode::WindowedHistory { .. } => {
+                    // State snapshot — both LatestOnly and WindowedHistory send current
+                    // state rather than computing expensive deltas
                     let state_bytes = doc.save();
                     batch.add_snapshot(doc_key, state_bytes);
                 }
-                SyncMode::FullHistory | SyncMode::WindowedHistory { .. } => {
+                SyncMode::FullHistory => {
                     // Delta sync - need to generate message
                     // Note: For batch sync we use a fresh sync state since we're
                     // sending to potentially multiple peers
@@ -2224,6 +2304,25 @@ impl AutomergeSyncCoordinator {
         state_bytes: Vec<u8>,
         payload_size: usize,
     ) -> Result<()> {
+        // Tombstone guard — reject state snapshots for deleted documents (ADR-034).
+        // Prevents resurrection of documents deleted in this partition.
+        if let Some(colon_pos) = doc_key.find(':') {
+            let collection = &doc_key[..colon_pos];
+            let doc_id = &doc_key[colon_pos + 1..];
+            if self
+                .store
+                .has_tombstone(collection, doc_id)
+                .unwrap_or(false)
+            {
+                tracing::debug!(
+                    doc_key = doc_key,
+                    peer = %peer_id.fmt_short(),
+                    "Rejecting state snapshot for tombstoned document"
+                );
+                return Ok(());
+            }
+        }
+
         // Track statistics first
         self.total_bytes_received
             .fetch_add(payload_size as u64, Ordering::Relaxed);
@@ -2384,17 +2483,32 @@ impl AutomergeSyncCoordinator {
                 target_peers
             }
             PropagationDirection::UpOnly | PropagationDirection::DownOnly => {
-                // UpOnly/DownOnly requires hierarchy context from PeatMesh layer
-                // At the transport layer, we don't know parent vs child relationships.
-                // Conservative approach: log warning and skip propagation.
-                // The PeatMesh layer should handle directional propagation.
-                tracing::debug!(
-                    "Tombstone {}:{} has {:?} propagation - skipping at transport layer (handled by PeatMesh)",
-                    tombstone_msg.tombstone.collection,
-                    tombstone_msg.tombstone.document_id,
-                    direction
-                );
-                Vec::new()
+                // Use SyncRouter for hierarchy-aware direction filtering
+                if let Some(router) = &self.sync_router {
+                    let sync_dir = match direction {
+                        PropagationDirection::UpOnly => SyncDirection::Upward,
+                        PropagationDirection::DownOnly => SyncDirection::Downward,
+                        _ => unreachable!(),
+                    };
+                    let targets = router.get_targets(sync_dir, &target_peers).await;
+                    tracing::debug!(
+                        "Propagating tombstone {}:{} to {} peers ({:?} via SyncRouter)",
+                        tombstone_msg.tombstone.collection,
+                        tombstone_msg.tombstone.document_id,
+                        targets.len(),
+                        direction
+                    );
+                    targets
+                } else {
+                    // No router configured — fall back to bidirectional (safe default)
+                    tracing::debug!(
+                        "No SyncRouter configured for {:?} tombstone {}:{} — falling back to bidirectional",
+                        direction,
+                        tombstone_msg.tombstone.collection,
+                        tombstone_msg.tombstone.document_id,
+                    );
+                    target_peers
+                }
             }
         };
 
@@ -2436,14 +2550,17 @@ impl AutomergeSyncCoordinator {
         let target_peers: Vec<EndpointId> = match direction {
             PropagationDirection::SystemWide | PropagationDirection::Bidirectional => all_peers,
             PropagationDirection::UpOnly | PropagationDirection::DownOnly => {
-                // Deferred to PR 3 (hierarchy-aware propagation)
-                tracing::debug!(
-                    "Tombstone {}:{} has {:?} propagation - skipping at transport layer",
-                    tombstone_msg.tombstone.collection,
-                    tombstone_msg.tombstone.document_id,
-                    direction
-                );
-                Vec::new()
+                if let Some(router) = &self.sync_router {
+                    let sync_dir = match direction {
+                        PropagationDirection::UpOnly => SyncDirection::Upward,
+                        PropagationDirection::DownOnly => SyncDirection::Downward,
+                        _ => unreachable!(),
+                    };
+                    router.get_targets(sync_dir, &all_peers).await
+                } else {
+                    // No router — fall back to all peers (safe default)
+                    all_peers
+                }
             }
         };
 

@@ -22,6 +22,7 @@ pub mod audit;
 pub mod bandwidth;
 pub mod deletion;
 pub mod eviction;
+pub mod eviction_service;
 pub mod garbage_collection;
 pub mod lifecycle;
 pub mod preemption;
@@ -133,6 +134,20 @@ impl QoSClass {
             Self::Normal => 20,
             Self::Low => 8,
             Self::Bulk => 2,
+        }
+    }
+
+    /// Returns the QoS class for a given collection name
+    ///
+    /// Maps collection names to priority classes based on operational importance.
+    /// Used by bandwidth allocation (PRD-004) and storage eviction (PRD-005).
+    pub fn for_collection(collection: &str) -> Self {
+        match collection {
+            "commands" | "contact_reports" | "alerts" => QoSClass::Critical,
+            "cells" | "nodes" | "audit_logs" => QoSClass::High,
+            "beacons" | "platforms" | "tracks" => QoSClass::Normal,
+            "node_positions" | "capabilities" | "node_states" => QoSClass::Low,
+            _ => QoSClass::Bulk,
         }
     }
 
@@ -396,6 +411,19 @@ mod tests {
 
         let deserialized: QoSClass = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, QoSClass::Critical);
+    }
+
+    #[test]
+    fn test_qos_class_for_collection() {
+        assert_eq!(QoSClass::for_collection("commands"), QoSClass::Critical);
+        assert_eq!(QoSClass::for_collection("contact_reports"), QoSClass::Critical);
+        assert_eq!(QoSClass::for_collection("alerts"), QoSClass::Critical);
+        assert_eq!(QoSClass::for_collection("cells"), QoSClass::High);
+        assert_eq!(QoSClass::for_collection("nodes"), QoSClass::High);
+        assert_eq!(QoSClass::for_collection("beacons"), QoSClass::Normal);
+        assert_eq!(QoSClass::for_collection("tracks"), QoSClass::Normal);
+        assert_eq!(QoSClass::for_collection("node_positions"), QoSClass::Low);
+        assert_eq!(QoSClass::for_collection("unknown_collection"), QoSClass::Bulk);
     }
 
     #[test]

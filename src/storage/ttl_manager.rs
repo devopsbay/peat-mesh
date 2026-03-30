@@ -120,6 +120,8 @@ impl TtlManager {
     ///
     /// This method is called by the background cleanup task every 10 seconds.
     /// It finds all documents with expiry times <= now and deletes them.
+    /// Documents are ordered according to the configured eviction strategy
+    /// (OldestFirst, KeepLastN, etc.) before deletion.
     ///
     /// # Returns
     ///
@@ -139,10 +141,10 @@ impl TtlManager {
                 .map(|(k, _)| *k)
                 .unwrap_or(now);
 
-            // Collect and remove all expired entries
+            // Collect expired entries with their expiry times for strategy-aware ordering
             let expired: Vec<_> = expiry_map
                 .range(..=split_key)
-                .flat_map(|(_, keys)| keys.clone())
+                .flat_map(|(expiry, keys)| keys.iter().map(move |k| (*expiry, k.clone())))
                 .collect();
 
             // Remove from map
@@ -151,13 +153,96 @@ impl TtlManager {
             expired
         };
 
+        // Apply eviction strategy ordering
+        let ordered_keys = self.apply_eviction_strategy(expired_keys);
+
         // Delete each expired document
-        for key in expired_keys {
+        for key in ordered_keys {
             self.store.delete(&key)?;
             count += 1;
         }
 
         Ok(count)
+    }
+
+    /// Order expired keys according to the configured eviction strategy
+    fn apply_eviction_strategy(&self, mut expired: Vec<(Instant, String)>) -> Vec<String> {
+        use super::ttl::EvictionStrategy;
+
+        match self.config.evict_strategy {
+            EvictionStrategy::OldestFirst => {
+                // Sort by expiry time ascending (oldest expired first)
+                expired.sort_by_key(|(expiry, _)| *expiry);
+                expired.into_iter().map(|(_, key)| key).collect()
+            }
+            EvictionStrategy::KeepLastN(n) => {
+                // Group by collection, keep last N per collection, evict the rest
+                use std::collections::HashMap;
+                let mut by_collection: HashMap<String, Vec<(Instant, String)>> = HashMap::new();
+                for (expiry, key) in expired {
+                    let collection = key.split('/').next().unwrap_or("").to_string();
+                    by_collection.entry(collection).or_default().push((expiry, key));
+                }
+                let mut to_delete = Vec::new();
+                for (_collection, mut entries) in by_collection {
+                    // Sort newest first, skip the last N, delete the rest
+                    entries.sort_by_key(|(expiry, _)| std::cmp::Reverse(*expiry));
+                    to_delete.extend(entries.into_iter().skip(n).map(|(_, key)| key));
+                }
+                to_delete
+            }
+            EvictionStrategy::StoragePressure { .. } | EvictionStrategy::None => {
+                // No special ordering — delete all expired
+                expired.into_iter().map(|(_, key)| key).collect()
+            }
+        }
+    }
+
+    /// Extend TTLs for all pending documents when the node is offline
+    ///
+    /// When no peers are connected, this extends remaining TTLs by the
+    /// configured offline retention multiplier (offline_ttl / online_ttl ratio).
+    /// This prevents premature eviction of data that can't be re-synced.
+    ///
+    /// Should be called periodically from the sync loop when `connected_peers()` is empty.
+    pub fn extend_ttls_for_offline(&self) {
+        let policy = match &self.config.offline_policy {
+            Some(p) => p,
+            None => return, // No offline policy configured
+        };
+
+        // Calculate extension factor: ratio of online to offline TTL
+        // A ratio > 1 means we extend (online is longer than offline)
+        // But when going offline, we want to retain longer, so use online/offline
+        let online_secs = policy.online_ttl.as_secs_f64();
+        let offline_secs = policy.offline_ttl.as_secs_f64();
+        if offline_secs <= 0.0 || online_secs <= 0.0 {
+            return;
+        }
+        // Extension factor: e.g., online=600s, offline=60s → factor=10x
+        let factor = online_secs / offline_secs;
+        if factor <= 1.0 {
+            return; // Offline TTL is already >= online TTL, nothing to extend
+        }
+
+        let now = Instant::now();
+        let mut expiry_map = self.expiry_map.write().unwrap_or_else(|e| e.into_inner());
+
+        // Collect entries that haven't expired yet and extend them
+        let entries: Vec<_> = expiry_map
+            .iter()
+            .filter(|(expiry, _)| **expiry > now)
+            .flat_map(|(expiry, keys)| keys.iter().map(move |k| (*expiry, k.clone())))
+            .collect();
+
+        // Remove the old entries and re-insert with extended expiry
+        expiry_map.clear();
+        for (old_expiry, key) in entries {
+            let remaining = old_expiry.duration_since(now);
+            let extended = Duration::from_secs_f64(remaining.as_secs_f64() * factor);
+            let new_expiry = now + extended;
+            expiry_map.entry(new_expiry).or_default().push(key);
+        }
     }
 
     /// Start background cleanup task
@@ -476,6 +561,79 @@ mod tests {
 
         // Verify pending count is back to 0
         assert_eq!(ttl_manager.pending_count(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_eviction_strategy_keep_last_n() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Arc::new(AutomergeStore::open(temp_dir.path())?);
+        let config = TtlConfig::new().with_eviction(EvictionStrategy::KeepLastN(2));
+        let ttl_manager = TtlManager::new(store.clone(), config);
+
+        // Insert 5 beacon documents with staggered short TTLs
+        for i in 0..5 {
+            let doc = Automerge::new();
+            store.put(&format!("beacons/node-{}", i), &doc)?;
+            ttl_manager.set_ttl(
+                &format!("beacons/node-{}", i),
+                Duration::from_millis(50 + i * 10),
+            )?;
+        }
+
+        // Wait for all to expire
+        sleep(Duration::from_millis(200)).await;
+
+        // Cleanup should keep last 2 (newest) and delete 3
+        let count = ttl_manager.cleanup_expired()?;
+        assert_eq!(count, 3, "KeepLastN(2) should delete 3 of 5 expired docs");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extend_ttls_for_offline() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Arc::new(AutomergeStore::open(temp_dir.path())?);
+        let config = TtlConfig::tactical(); // online_ttl=600s, offline_ttl=60s → 10x extension
+        let ttl_manager = TtlManager::new(store.clone(), config);
+
+        // Set a TTL that expires in 1 second
+        let doc = Automerge::new();
+        store.put("beacons/test-offline", &doc)?;
+        ttl_manager.set_ttl("beacons/test-offline", Duration::from_secs(1))?;
+        assert_eq!(ttl_manager.pending_count(), 1);
+
+        // Extend TTLs (simulates going offline) — should multiply remaining by 10x
+        ttl_manager.extend_ttls_for_offline();
+
+        // Wait 1.5 seconds — original would have expired, extended should not
+        sleep(Duration::from_millis(1500)).await;
+
+        // Cleanup should find 0 expired (because TTL was extended)
+        let count = ttl_manager.cleanup_expired()?;
+        assert_eq!(count, 0, "Extended TTL should not have expired yet");
+        assert_eq!(ttl_manager.pending_count(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extend_ttls_no_offline_policy() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Arc::new(AutomergeStore::open(temp_dir.path())?);
+        let config = TtlConfig::long_duration(); // offline_policy = None
+        let ttl_manager = TtlManager::new(store.clone(), config);
+
+        ttl_manager.set_ttl("beacons/test", Duration::from_millis(100))?;
+
+        // Should be a no-op when no offline policy configured
+        ttl_manager.extend_ttls_for_offline();
+
+        sleep(Duration::from_millis(150)).await;
+        let count = ttl_manager.cleanup_expired()?;
+        assert_eq!(count, 1, "Without offline policy, TTL should not be extended");
 
         Ok(())
     }

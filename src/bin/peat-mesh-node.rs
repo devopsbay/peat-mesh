@@ -9,7 +9,10 @@ use peat_mesh::config::{IrohConfig, MeshConfig};
 use peat_mesh::discovery::{KubernetesDiscovery, KubernetesDiscoveryConfig};
 use peat_mesh::mesh::PeatMeshBuilder;
 use peat_mesh::peer_connector::PeerConnector;
-use peat_mesh::qos::{start_periodic_gc, DeletionPolicyRegistry, GarbageCollector, GcConfig};
+use peat_mesh::qos::{
+    eviction_service::StorageEvictionService, start_periodic_gc, DeletionPolicyRegistry,
+    EvictionConfig, GarbageCollector, GcConfig,
+};
 use peat_mesh::security::{DeviceKeypair, FormationKey};
 use peat_mesh::storage::{
     AutomergeStore, AutomergeSyncCoordinator, CertificateStore, EnrollmentProtocolHandler,
@@ -220,6 +223,27 @@ async fn run() -> anyhow::Result<()> {
     let gc_handle = start_periodic_gc(gc.clone());
     info!("Garbage collector started (interval=5m)");
 
+    // ── Storage eviction service (PRD-005) ──────────────────────
+    let max_storage_bytes: usize = std::env::var("PEAT_STORAGE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512 * 1024 * 1024); // Default: 512 MB
+    let eviction_config = match std::env::var("PEAT_EVICTION_PRESET").as_deref() {
+        Ok("aggressive") => EvictionConfig::aggressive(),
+        Ok("conservative") => EvictionConfig::conservative(),
+        _ => EvictionConfig::default(),
+    };
+    let eviction_service = Arc::new(StorageEvictionService::new(
+        automerge_store.clone(),
+        max_storage_bytes,
+        eviction_config,
+    ));
+    eviction_service.start();
+    info!(
+        max_bytes = max_storage_bytes,
+        "Storage eviction service started"
+    );
+
     // ── Sync transport (shares endpoint with blob store) ────────
     let sync_transport = Arc::new(MeshSyncTransport::new(endpoint.clone()));
 
@@ -236,6 +260,44 @@ async fn run() -> anyhow::Result<()> {
     ));
     coordinator.set_channel_manager(channel_manager);
     coordinator.set_ttl_manager(ttl_manager.clone());
+
+    // ── Bandwidth allocation (PRD-004) ────────────────────────
+    let bandwidth_bps: u64 = std::env::var("PEAT_BANDWIDTH_BPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000); // Default: 1 Mbps (tactical)
+    let bandwidth_alloc = Arc::new(peat_mesh::qos::BandwidthAllocation::new(bandwidth_bps));
+    coordinator.set_bandwidth_allocation(bandwidth_alloc);
+    info!(bandwidth_bps = bandwidth_bps, "Bandwidth allocation configured");
+
+    // ── Sync mode overrides (PRD-003) ─────────────────────────
+    // Format: PEAT_SYNC_MODE_OVERRIDES="collection=mode,..." where mode is
+    // "latest_only", "full_history", or "windowed:SECONDS"
+    if let Ok(overrides) = std::env::var("PEAT_SYNC_MODE_OVERRIDES") {
+        use peat_mesh::qos::SyncMode;
+        let registry = coordinator.sync_mode_registry();
+        for entry in overrides.split(',') {
+            let entry = entry.trim();
+            if let Some((collection, mode_str)) = entry.split_once('=') {
+                let mode = match mode_str.trim() {
+                    "latest_only" => Some(SyncMode::LatestOnly),
+                    "full_history" => Some(SyncMode::FullHistory),
+                    s if s.starts_with("windowed:") => s[9..]
+                        .parse::<u64>()
+                        .ok()
+                        .map(|secs| SyncMode::WindowedHistory { window_seconds: secs }),
+                    _ => {
+                        warn!(entry = entry, "Invalid sync mode override, skipping");
+                        None
+                    }
+                };
+                if let Some(mode) = mode {
+                    registry.set(collection.trim(), mode);
+                    info!(collection = collection.trim(), mode = %mode_str.trim(), "Sync mode override applied");
+                }
+            }
+        }
+    }
 
     // ── Sync protocol handler (for incoming QUIC connections) ───
     let mut sync_handler = SyncProtocolHandler::new(sync_transport.clone(), coordinator.clone());
@@ -347,6 +409,7 @@ async fn run() -> anyhow::Result<()> {
     let _sync_poll_handle = {
         let coordinator = coordinator.clone();
         let transport = sync_transport.clone();
+        let ttl_for_sync = ttl_manager.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -359,6 +422,11 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
                 let peers = transport.connected_peers();
+                // When offline (no peers), extend TTLs to prevent premature eviction
+                if peers.is_empty() {
+                    ttl_for_sync.extend_ttls_for_offline();
+                    continue;
+                }
                 for peer_id in peers {
                     if let Err(e) = coordinator.sync_all_documents_with_peer(peer_id).await {
                         warn!(
