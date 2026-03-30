@@ -416,14 +416,20 @@ mod tests {
     #[test]
     fn test_qos_class_for_collection() {
         assert_eq!(QoSClass::for_collection("commands"), QoSClass::Critical);
-        assert_eq!(QoSClass::for_collection("contact_reports"), QoSClass::Critical);
+        assert_eq!(
+            QoSClass::for_collection("contact_reports"),
+            QoSClass::Critical
+        );
         assert_eq!(QoSClass::for_collection("alerts"), QoSClass::Critical);
         assert_eq!(QoSClass::for_collection("cells"), QoSClass::High);
         assert_eq!(QoSClass::for_collection("nodes"), QoSClass::High);
         assert_eq!(QoSClass::for_collection("beacons"), QoSClass::Normal);
         assert_eq!(QoSClass::for_collection("tracks"), QoSClass::Normal);
         assert_eq!(QoSClass::for_collection("node_positions"), QoSClass::Low);
-        assert_eq!(QoSClass::for_collection("unknown_collection"), QoSClass::Bulk);
+        assert_eq!(
+            QoSClass::for_collection("unknown_collection"),
+            QoSClass::Bulk
+        );
     }
 
     #[test]

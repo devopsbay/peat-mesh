@@ -268,7 +268,10 @@ async fn run() -> anyhow::Result<()> {
         .unwrap_or(1_000_000); // Default: 1 Mbps (tactical)
     let bandwidth_alloc = Arc::new(peat_mesh::qos::BandwidthAllocation::new(bandwidth_bps));
     coordinator.set_bandwidth_allocation(bandwidth_alloc);
-    info!(bandwidth_bps = bandwidth_bps, "Bandwidth allocation configured");
+    info!(
+        bandwidth_bps = bandwidth_bps,
+        "Bandwidth allocation configured"
+    );
 
     // ── Sync mode overrides (PRD-003) ─────────────────────────
     // Format: PEAT_SYNC_MODE_OVERRIDES="collection=mode,..." where mode is
@@ -282,10 +285,14 @@ async fn run() -> anyhow::Result<()> {
                 let mode = match mode_str.trim() {
                     "latest_only" => Some(SyncMode::LatestOnly),
                     "full_history" => Some(SyncMode::FullHistory),
-                    s if s.starts_with("windowed:") => s[9..]
-                        .parse::<u64>()
-                        .ok()
-                        .map(|secs| SyncMode::WindowedHistory { window_seconds: secs }),
+                    s if s.starts_with("windowed:") => {
+                        s[9..]
+                            .parse::<u64>()
+                            .ok()
+                            .map(|secs| SyncMode::WindowedHistory {
+                                window_seconds: secs,
+                            })
+                    }
                     _ => {
                         warn!(entry = entry, "Invalid sync mode override, skipping");
                         None

@@ -49,8 +49,8 @@ impl StorageEvictionService {
     ) -> Self {
         let qos_storage = Arc::new(QoSAwareStorage::new(max_storage_bytes));
         let audit_log = Arc::new(EvictionAuditLog::new(1000));
-        let controller = EvictionController::new(Arc::clone(&qos_storage), audit_log)
-            .with_config(config);
+        let controller =
+            EvictionController::new(Arc::clone(&qos_storage), audit_log).with_config(config);
 
         // Set the eviction callback to delete from AutomergeStore
         let store_for_callback = Arc::clone(&store);
@@ -148,9 +148,9 @@ impl Drop for StorageEvictionService {
 
 #[cfg(all(test, feature = "automerge-backend"))]
 mod tests {
-    use super::*;
     use super::super::audit::EvictionAuditLog;
     use super::super::eviction::EvictionController;
+    use super::*;
     use automerge::Automerge;
 
     #[tokio::test]
@@ -167,7 +167,11 @@ mod tests {
         // Register a document that's 500 bytes (50% of 1KB)
         service.register_document("tracks:doc-1", 500);
         let pressure = service.storage_pressure();
-        assert!(pressure > 0.4 && pressure < 0.6, "Expected ~50% pressure, got {}", pressure);
+        assert!(
+            pressure > 0.4 && pressure < 0.6,
+            "Expected ~50% pressure, got {}",
+            pressure
+        );
 
         // Unregister and pressure should drop
         service.unregister_document("tracks:doc-1");
@@ -181,9 +185,9 @@ mod tests {
         let service = StorageEvictionService::new(store, 10240, EvictionConfig::default());
 
         // Register documents from different collections
-        service.register_document("commands:cmd-1", 100);     // Critical
-        service.register_document("tracks:track-1", 100);     // Normal
-        service.register_document("unknown:bulk-1", 100);     // Bulk
+        service.register_document("commands:cmd-1", 100); // Critical
+        service.register_document("tracks:track-1", 100); // Normal
+        service.register_document("unknown:bulk-1", 100); // Bulk
 
         // All should be tracked
         let pressure = service.storage_pressure();
@@ -207,12 +211,10 @@ mod tests {
             ..EvictionConfig::default()
         };
         // Use low max storage AND low QoSAwareStorage threshold
-        let qos_storage = Arc::new(
-            QoSAwareStorage::new(500).with_eviction_threshold(0.3),
-        );
+        let qos_storage = Arc::new(QoSAwareStorage::new(500).with_eviction_threshold(0.3));
         let audit_log = Arc::new(EvictionAuditLog::new(100));
-        let controller = EvictionController::new(Arc::clone(&qos_storage), audit_log)
-            .with_config(config);
+        let controller =
+            EvictionController::new(Arc::clone(&qos_storage), audit_log).with_config(config);
 
         let store_cb = Arc::clone(&store);
         controller.set_eviction_callback(Box::new(move |doc_id: &str| {
@@ -222,12 +224,16 @@ mod tests {
         }));
 
         // Register with sizes that exceed threshold (400/500 = 80% > 30%)
-        qos_storage.register_document(
-            super::super::storage::StoredDocument::new("unknown:bulk-1", QoSClass::Bulk, 200),
-        );
-        qos_storage.register_document(
-            super::super::storage::StoredDocument::new("tracks:normal-1", QoSClass::Normal, 200),
-        );
+        qos_storage.register_document(super::super::storage::StoredDocument::new(
+            "unknown:bulk-1",
+            QoSClass::Bulk,
+            200,
+        ));
+        qos_storage.register_document(super::super::storage::StoredDocument::new(
+            "tracks:normal-1",
+            QoSClass::Normal,
+            200,
+        ));
 
         // Pressure should be high enough to trigger
         assert!(

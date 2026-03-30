@@ -181,7 +181,10 @@ impl TtlManager {
                 let mut by_collection: HashMap<String, Vec<(Instant, String)>> = HashMap::new();
                 for (expiry, key) in expired {
                     let collection = key.split('/').next().unwrap_or("").to_string();
-                    by_collection.entry(collection).or_default().push((expiry, key));
+                    by_collection
+                        .entry(collection)
+                        .or_default()
+                        .push((expiry, key));
                 }
                 let mut to_delete = Vec::new();
                 for (_collection, mut entries) in by_collection {
@@ -633,7 +636,10 @@ mod tests {
 
         sleep(Duration::from_millis(150)).await;
         let count = ttl_manager.cleanup_expired()?;
-        assert_eq!(count, 1, "Without offline policy, TTL should not be extended");
+        assert_eq!(
+            count, 1,
+            "Without offline policy, TTL should not be extended"
+        );
 
         Ok(())
     }
