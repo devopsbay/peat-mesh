@@ -7,6 +7,7 @@
 
 use crate::discovery::DiscoveryEvent;
 use crate::security::certificate::CertificateBundle;
+use crate::security::FormationPeerSet;
 use crate::storage::NetworkedIrohBlobStore;
 use hkdf::Hkdf;
 use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
@@ -24,12 +25,13 @@ use tracing::{debug, info, warn};
 pub struct PeerConnector {
     formation_secret: Vec<u8>,
     blob_store: Arc<NetworkedIrohBlobStore>,
+    /// Known formation member EndpointIds. Updated as peers are
+    /// discovered/lost. Used by [`FormationEndpointHooks`] to gate
+    /// QUIC connections at the transport level.
+    formation_peers: FormationPeerSet,
     /// Optional certificate bundle for peer validation.
-    /// When set, only peers with valid certificates are connected.
+    /// When set, peers without valid certificates are rejected.
     certificate_bundle: Option<Arc<RwLock<CertificateBundle>>>,
-    /// Whether to require peer certificates. When false and a bundle is present,
-    /// unknown peers are allowed with a warning.
-    require_certificates: bool,
 }
 
 impl PeerConnector {
@@ -39,23 +41,26 @@ impl PeerConnector {
     ///
     /// * `formation_secret` - Shared secret (raw bytes, already base64-decoded)
     /// * `blob_store` - The networked blob store whose MemoryLookup and peer list to update
-    pub fn new(formation_secret: Vec<u8>, blob_store: Arc<NetworkedIrohBlobStore>) -> Self {
+    /// * `formation_peers` - Shared set of known formation member EndpointIds,
+    ///   updated as peers are discovered/lost
+    pub fn new(
+        formation_secret: Vec<u8>,
+        blob_store: Arc<NetworkedIrohBlobStore>,
+        formation_peers: FormationPeerSet,
+    ) -> Self {
         Self {
             formation_secret,
             blob_store,
+            formation_peers,
             certificate_bundle: None,
-            require_certificates: false,
         }
     }
 
     /// Set the certificate bundle for peer validation.
-    pub fn with_certificate_bundle(
-        mut self,
-        bundle: Arc<RwLock<CertificateBundle>>,
-        require: bool,
-    ) -> Self {
+    ///
+    /// When set, peers without valid certificates are rejected.
+    pub fn with_certificate_bundle(mut self, bundle: Arc<RwLock<CertificateBundle>>) -> Self {
         self.certificate_bundle = Some(bundle);
-        self.require_certificates = require;
         self
     }
 
@@ -96,7 +101,7 @@ impl PeerConnector {
                             continue;
                         }
 
-                        // Certificate validation
+                        // Certificate validation (hard-reject when configured)
                         if let Some(ref bundle) = self.certificate_bundle {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -104,25 +109,18 @@ impl PeerConnector {
                                 .as_millis() as u64;
                             let bundle = bundle.read().unwrap_or_else(|e| e.into_inner());
                             if !bundle.validate_node_id(&peer_info.node_id, now) {
-                                if self.require_certificates {
-                                    warn!(
-                                        peer = %peer_info.node_id,
-                                        "Rejecting peer: no valid certificate"
-                                    );
-                                    continue;
-                                }
-                                debug!(
+                                warn!(
                                     peer = %peer_info.node_id,
-                                    "Peer has no certificate (not required)"
+                                    "Rejecting peer: no valid certificate"
                                 );
-                            } else {
-                                let tier = bundle.get_node_tier(&peer_info.node_id);
-                                info!(
-                                    peer = %peer_info.node_id,
-                                    tier = ?tier,
-                                    "Peer certificate validated"
-                                );
+                                continue;
                             }
+                            let tier = bundle.get_node_tier(&peer_info.node_id);
+                            info!(
+                                peer = %peer_info.node_id,
+                                tier = ?tier,
+                                "Peer certificate validated"
+                            );
                         }
 
                         let addrs: std::collections::BTreeSet<TransportAddr> = peer_info
@@ -140,12 +138,13 @@ impl PeerConnector {
                             .memory_lookup()
                             .add_endpoint_info(endpoint_addr);
                         self.blob_store.add_peer(endpoint_id).await;
+                        self.formation_peers.insert(endpoint_id);
 
                         info!(
                             peer = %peer_info.node_id,
                             endpoint_id = %endpoint_id.fmt_short(),
                             addresses = ?peer_info.addresses,
-                            "Peer connected to Iroh"
+                            "Peer connected to Iroh (formation member)"
                         );
                     }
                     DiscoveryEvent::PeerLost(node_id) => {
@@ -155,11 +154,12 @@ impl PeerConnector {
                             .memory_lookup()
                             .remove_endpoint_info(endpoint_id);
                         self.blob_store.remove_peer(&endpoint_id).await;
+                        self.formation_peers.remove(&endpoint_id);
 
                         info!(
                             peer = %node_id,
                             endpoint_id = %endpoint_id.fmt_short(),
-                            "Peer removed from Iroh"
+                            "Peer removed from Iroh (formation member removed)"
                         );
                     }
                     DiscoveryEvent::PeerUpdated(peer_info) => {
@@ -169,7 +169,7 @@ impl PeerConnector {
                             continue;
                         }
 
-                        // Re-validate certificate on update
+                        // Re-validate certificate on update (hard-reject when configured)
                         let should_remove = if let Some(ref bundle) = self.certificate_bundle {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -177,7 +177,6 @@ impl PeerConnector {
                                 .as_millis() as u64;
                             let bundle = bundle.read().unwrap_or_else(|e| e.into_inner());
                             !bundle.validate_node_id(&peer_info.node_id, now)
-                                && self.require_certificates
                         } else {
                             false
                         };
@@ -190,6 +189,7 @@ impl PeerConnector {
                                 .memory_lookup()
                                 .remove_endpoint_info(endpoint_id);
                             self.blob_store.remove_peer(&endpoint_id).await;
+                            self.formation_peers.remove(&endpoint_id);
                             continue;
                         }
 

@@ -22,6 +22,17 @@ pub trait SyncTransport: Send + Sync + 'static {
     /// Get an existing connection to a peer, if one exists.
     fn get_connection(&self, peer_id: &EndpointId) -> Option<Connection>;
 
+    /// Get an existing connection or establish a new authenticated one.
+    ///
+    /// The default implementation simply delegates to [`get_connection`](Self::get_connection).
+    /// [`MeshSyncTransport`](super::mesh_sync_transport::MeshSyncTransport)
+    /// overrides this to establish outgoing connections with formation key
+    /// authentication when no cached connection exists.
+    async fn get_or_connect(&self, peer_id: &EndpointId) -> anyhow::Result<Connection> {
+        self.get_connection(peer_id)
+            .ok_or_else(|| anyhow::anyhow!("no connection to peer"))
+    }
+
     /// List all currently connected peer IDs.
     fn connected_peers(&self) -> Vec<EndpointId>;
 }

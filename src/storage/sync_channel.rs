@@ -171,10 +171,8 @@ impl SyncChannel {
         coordinator: Arc<AutomergeSyncCoordinator>,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Self> {
-        // Get connection to peer
-        let conn = transport
-            .get_connection(&peer_id)
-            .context("No connection to peer")?;
+        // Get connection to peer (or establish authenticated one)
+        let conn = transport.get_or_connect(&peer_id).await?;
 
         // Open bidirectional stream
         let (send, recv) = conn
@@ -441,11 +439,8 @@ impl SyncChannel {
         // Wait before reconnecting
         tokio::time::sleep(Self::RECONNECT_DELAY).await;
 
-        // Get connection
-        let conn = self
-            .transport
-            .get_connection(&self.peer_id)
-            .context("No connection to peer for reconnection")?;
+        // Get connection (or establish authenticated one)
+        let conn = self.transport.get_or_connect(&self.peer_id).await?;
 
         // Open new stream
         let (send, mut recv) = conn

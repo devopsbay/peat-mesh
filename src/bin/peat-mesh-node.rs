@@ -13,7 +13,7 @@ use peat_mesh::qos::{
     eviction_service::StorageEvictionService, start_periodic_gc, DeletionPolicyRegistry,
     EvictionConfig, GarbageCollector, GcConfig,
 };
-use peat_mesh::security::{DeviceKeypair, FormationKey};
+use peat_mesh::security::{DeviceKeypair, FormationKey, FormationPeerSet};
 use peat_mesh::storage::{
     AutomergeStore, AutomergeSyncCoordinator, CertificateStore, EnrollmentProtocolHandler,
     MeshSyncTransport, NetworkedIrohBlobStore, SyncChannelManager, SyncProtocolHandler,
@@ -71,9 +71,6 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Certificate / enrollment env vars ──────────────────────
     let authority_key_hex = std::env::var("PEAT_AUTHORITY_KEY").ok();
-    let require_certificates = std::env::var("PEAT_REQUIRE_CERTIFICATES")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
     let enrollment_tokens_raw = std::env::var("PEAT_ENROLLMENT_TOKENS").ok();
 
     info!(
@@ -82,9 +79,8 @@ async fn run() -> anyhow::Result<()> {
         broker_port = broker_port,
         iroh_bind_port = iroh_bind_port,
         certificates = authority_key_hex.is_some(),
-        require_certificates,
         enrollment = enrollment_tokens_raw.is_some(),
-        "Starting peat-mesh-node"
+        "Starting peat-mesh-node (all connections require formation credentials)"
     );
 
     // ── Formation key ────────────────────────────────────────────
@@ -154,14 +150,22 @@ async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to start discovery: {}", e))?;
     info!("Discovery started");
 
-    // ── Build Iroh endpoint ──────────────────────────────────────
-    let (endpoint, memory_lookup) = NetworkedIrohBlobStore::build_endpoint(&mesh_config.iroh)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to build Iroh endpoint: {}", e))?;
+    // ── Build Iroh endpoint with formation peer gating ────────────
+    let formation_peers = FormationPeerSet::new();
+
+    let (endpoint, memory_lookup) = NetworkedIrohBlobStore::build_endpoint_with_formation_peers(
+        &mesh_config.iroh,
+        formation_peers.clone(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to build Iroh endpoint: {}", e))?;
+
+    // Insert our own EndpointId so we don't reject loopback connections
+    formation_peers.insert(endpoint.id());
 
     info!(
         iroh_endpoint_id = %endpoint.id().fmt_short(),
-        "Iroh endpoint ready"
+        "Iroh endpoint ready (formation peer gating active)"
     );
 
     // ── Advertise via discovery ──────────────────────────────────
@@ -245,7 +249,10 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ── Sync transport (shares endpoint with blob store) ────────
-    let sync_transport = Arc::new(MeshSyncTransport::new(endpoint.clone()));
+    let sync_transport = Arc::new(MeshSyncTransport::new(
+        endpoint.clone(),
+        formation_key.clone(),
+    ));
 
     // ── Sync coordinator ────────────────────────────────────────
     let coordinator = Arc::new(AutomergeSyncCoordinator::new(
@@ -307,15 +314,16 @@ async fn run() -> anyhow::Result<()> {
     }
 
     // ── Sync protocol handler (for incoming QUIC connections) ───
-    let mut sync_handler = SyncProtocolHandler::new(sync_transport.clone(), coordinator.clone());
+    let mut sync_handler = SyncProtocolHandler::new(
+        sync_transport.clone(),
+        coordinator.clone(),
+        formation_key.clone(),
+    );
 
     // Wire Layer 2 certificate gating if configured
     if let Some(ref bundle) = certificate_bundle {
-        sync_handler = sync_handler.with_certificate_bundle(bundle.clone(), require_certificates);
-        info!(
-            require = require_certificates,
-            "Layer 2 certificate gating enabled on sync protocol"
-        );
+        sync_handler = sync_handler.with_certificate_bundle(bundle.clone());
+        info!("Layer 2 certificate gating enabled on sync protocol (hard-reject)");
     }
 
     // ── Enrollment protocol handler (Layer 1) ────────────────────
@@ -394,9 +402,10 @@ async fn run() -> anyhow::Result<()> {
     info!(node_id = %mesh.node_id(), device_id = %device_id, "Mesh started");
 
     // ── Spawn PeerConnector ──────────────────────────────────────
-    let mut connector = PeerConnector::new(seed.clone(), blob_store.clone());
+    let mut connector =
+        PeerConnector::new(seed.clone(), blob_store.clone(), formation_peers.clone());
     if let Some(ref bundle) = certificate_bundle {
-        connector = connector.with_certificate_bundle(bundle.clone(), require_certificates);
+        connector = connector.with_certificate_bundle(bundle.clone());
     }
     let _connector_handle = connector.run(event_stream);
 

@@ -525,6 +525,63 @@ use tokio::sync::RwLock as TokioRwLock;
 struct NoopEndpointHooks;
 impl iroh::endpoint::EndpointHooks for NoopEndpointHooks {}
 
+/// Endpoint hooks that reject QUIC connections from peers not in the
+/// [`FormationPeerSet`].
+///
+/// Enrollment ALPN (`peat/enroll/1`) is exempted because enrolling
+/// devices are not yet formation members — enrollment has its own
+/// token-based authentication.
+///
+/// All other ALPNs (sync, blobs, etc.) require the remote peer's
+/// `EndpointId` to be present in the allowed set. Since EndpointIds
+/// are derived from the formation secret via HKDF and QUIC TLS proves
+/// private key possession, this is sufficient to gate access.
+#[derive(Debug, Clone)]
+pub struct FormationEndpointHooks {
+    allowed_peers: crate::security::FormationPeerSet,
+}
+
+impl FormationEndpointHooks {
+    pub fn new(allowed_peers: crate::security::FormationPeerSet) -> Self {
+        Self { allowed_peers }
+    }
+}
+
+impl iroh::endpoint::EndpointHooks for FormationEndpointHooks {
+    fn after_handshake<'a>(
+        &'a self,
+        conn: &'a iroh::endpoint::ConnectionInfo,
+    ) -> impl std::future::Future<Output = iroh::endpoint::AfterHandshakeOutcome> + Send + 'a {
+        async move {
+            // Enrollment ALPN is exempted — new devices need to enroll
+            // before they become formation members.
+            if conn.alpn() == super::enrollment_transport::CAP_ENROLLMENT_ALPN {
+                return iroh::endpoint::AfterHandshakeOutcome::Accept;
+            }
+
+            let remote = conn.remote_id();
+            if self.allowed_peers.contains(&remote) {
+                tracing::debug!(
+                    peer = %remote.fmt_short(),
+                    alpn = %String::from_utf8_lossy(conn.alpn()),
+                    "QUIC connection accepted (formation member)"
+                );
+                iroh::endpoint::AfterHandshakeOutcome::Accept
+            } else {
+                tracing::warn!(
+                    peer = %remote.fmt_short(),
+                    alpn = %String::from_utf8_lossy(conn.alpn()),
+                    "QUIC connection REJECTED (not a formation member)"
+                );
+                iroh::endpoint::AfterHandshakeOutcome::Reject {
+                    error_code: 3u32.into(),
+                    reason: b"not a formation member".to_vec(),
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // BlobPeerIndex - O(1) blob-to-peer resolution
 // ============================================================================
@@ -671,14 +728,28 @@ impl NetworkedIrohBlobStore {
         Self::from_config(blob_dir, &config).await
     }
 
-    /// Build an Iroh [`Endpoint`] and [`MemoryLookup`] from an [`IrohConfig`].
+    /// Build an Iroh [`Endpoint`] and [`MemoryLookup`] from an [`IrohConfig`]
+    /// **without** formation peer gating.
     ///
-    /// Use this when you need to access the endpoint before constructing the
-    /// blob store (e.g. to share it with [`MeshSyncTransport`]).
-    ///
-    /// [`MeshSyncTransport`]: super::mesh_sync_transport::MeshSyncTransport
+    /// **Warning:** This creates an unauthenticated endpoint. Production code
+    /// must use [`build_endpoint_with_formation_peers`](Self::build_endpoint_with_formation_peers)
+    /// to enforce mandatory credential authentication on all connections.
     pub async fn build_endpoint(config: &IrohConfig) -> Result<(Endpoint, MemoryLookup)> {
         Self::build_endpoint_with_hooks(config, None::<NoopEndpointHooks>).await
+    }
+
+    /// Build an Iroh [`Endpoint`] and [`MemoryLookup`] with
+    /// [`FormationEndpointHooks`] that reject connections from unknown peers.
+    ///
+    /// This is the required entry point for production use. All QUIC
+    /// connections (sync, blobs, etc.) are gated — only peers in the
+    /// `formation_peers` set are accepted. Enrollment ALPN is exempted.
+    pub async fn build_endpoint_with_formation_peers(
+        config: &IrohConfig,
+        formation_peers: crate::security::FormationPeerSet,
+    ) -> Result<(Endpoint, MemoryLookup)> {
+        let hooks = FormationEndpointHooks::new(formation_peers);
+        Self::build_endpoint_with_hooks(config, Some(hooks)).await
     }
 
     /// Build an Iroh [`Endpoint`] and [`MemoryLookup`] with optional

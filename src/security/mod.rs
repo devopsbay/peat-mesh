@@ -22,6 +22,8 @@ pub mod encryption;
 pub mod enrollment;
 pub mod error;
 pub mod formation_key;
+#[cfg(feature = "automerge-backend")]
+pub mod formation_peers;
 pub mod genesis;
 pub mod keypair;
 
@@ -43,6 +45,8 @@ pub use formation_key::{
     FormationAuthResult, FormationChallenge, FormationChallengeResponse, FormationKey,
     FORMATION_CHALLENGE_SIZE, FORMATION_RESPONSE_SIZE,
 };
+#[cfg(feature = "automerge-backend")]
+pub use formation_peers::FormationPeerSet;
 pub use genesis::{MembershipPolicy, MeshCredentials, MeshGenesis};
 pub use keypair::DeviceKeypair;
 

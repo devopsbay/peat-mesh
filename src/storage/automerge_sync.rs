@@ -988,10 +988,7 @@ impl AutomergeSyncCoordinator {
         }
 
         // Fallback: Open a new stream (legacy path)
-        let conn = self
-            .transport
-            .get_connection(&peer_id)
-            .context("No connection to peer")?;
+        let conn = self.transport.get_or_connect(&peer_id).await?;
 
         let (mut send, mut recv) = conn
             .open_bi()
@@ -1180,10 +1177,7 @@ impl AutomergeSyncCoordinator {
         }
 
         // Fallback: Open a new stream (legacy path)
-        let conn = self
-            .transport
-            .get_connection(&peer_id)
-            .context("No connection to peer")?;
+        let conn = self.transport.get_or_connect(&peer_id).await?;
 
         let (mut send, mut recv) = conn
             .open_bi()
@@ -1630,10 +1624,7 @@ impl AutomergeSyncCoordinator {
         }
 
         // Get connection to peer
-        let conn = self
-            .transport
-            .get_connection(&peer_id)
-            .context("No connection to peer")?;
+        let conn = self.transport.get_or_connect(&peer_id).await?;
 
         // Open a bidirectional stream
         let (mut send, mut recv) = conn
@@ -2842,10 +2833,7 @@ impl AutomergeSyncCoordinator {
     pub async fn send_negentropy_init(&self, peer_id: EndpointId) -> Result<()> {
         let init_msg = self.initiate_negentropy_sync(peer_id)?;
 
-        let conn = self
-            .transport
-            .get_connection(&peer_id)
-            .context("No connection to peer")?;
+        let conn = self.transport.get_or_connect(&peer_id).await?;
 
         let (mut send, mut recv) = conn
             .open_bi()
@@ -2890,10 +2878,7 @@ impl AutomergeSyncCoordinator {
     /// 2. Send documents we have that peer needs
     /// 3. Request documents peer has that we need
     pub async fn sync_with_peer_negentropy(&self, peer_id: EndpointId) -> Result<()> {
-        let conn = self
-            .transport
-            .get_connection(&peer_id)
-            .context("No connection to peer")?;
+        let conn = self.transport.get_or_connect(&peer_id).await?;
 
         // Phase 1: Initiate Negentropy sync
         let init_msg = self.initiate_negentropy_sync(peer_id)?;
@@ -3175,10 +3160,7 @@ impl AutomergeSyncCoordinator {
     /// * `peer_id` - The EndpointId of the peer to send heartbeat to
     pub async fn send_heartbeat(&self, peer_id: EndpointId) -> Result<()> {
         // Get connection to peer
-        let conn = self
-            .transport
-            .get_connection(&peer_id)
-            .context("No connection to peer")?;
+        let conn = self.transport.get_or_connect(&peer_id).await?;
 
         // Open a unidirectional stream (heartbeats don't need response)
         let mut send = conn

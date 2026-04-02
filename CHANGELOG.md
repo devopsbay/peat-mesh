@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-04-02
+
+### Security
+
+- **BREAKING**: Enforce mandatory formation credentials on all Iroh QUIC connections
+  - `FormationKey` is now required (not optional) for `SyncProtocolHandler` and `MeshSyncTransport`
+  - New `FormationEndpointHooks` gates ALL QUIC connections (sync, blobs) at transport level — only formation members accepted
+  - New `FormationPeerSet` tracks known formation member EndpointIds, populated by discovery
+  - Outgoing sync connections now run `respond_to_formation_auth()` HMAC challenge-response
+  - Removed "warn-and-allow" certificate mode — certificates are always hard-enforced when configured
+  - Removed `PEAT_REQUIRE_CERTIFICATES` env var — certificates always required when bundle is present
+
+### Added
+
+- `FormationPeerSet` type in `security::formation_peers` for thread-safe peer tracking
+- `FormationEndpointHooks` in `storage::iroh_blob_store` for QUIC-level connection gating
+- `MeshSyncTransport::connect_and_authenticate()` for authenticated outbound connections
+- `SyncTransport::get_or_connect()` trait method with default fallback implementation
+- `NetworkedIrohBlobStore::build_endpoint_with_formation_peers()` for production endpoint construction
+
+### Changed
+
+- `SyncProtocolHandler::new()` now requires `FormationKey` parameter (breaking)
+- `SyncProtocolHandler::with_certificate_bundle()` no longer takes `require` parameter (breaking)
+- `MeshSyncTransport::new()` now requires `FormationKey` parameter (breaking)
+- `PeerConnector::new()` now requires `FormationPeerSet` parameter (breaking)
+- `PeerConnector::with_certificate_bundle()` no longer takes `require` parameter (breaking)
+- All sync connection sites use `get_or_connect()` instead of `get_connection()` for authenticated fallback
+
 ## [0.2.0] - 2026-02-20
 
 ### Added

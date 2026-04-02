@@ -20,7 +20,7 @@ use iroh::{Endpoint, EndpointId, Watcher};
 use tracing::{debug, info, warn};
 
 use super::automerge_sync::AutomergeSyncCoordinator;
-use super::sync_transport::SyncTransport;
+use super::sync_transport::{SyncTransport, CAP_AUTOMERGE_ALPN};
 use crate::security::formation_key::{
     FormationAuthResult, FormationChallenge, FormationChallengeResponse, FormationKey,
 };
@@ -34,9 +34,13 @@ const FORMATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Lightweight transport for peat-mesh-node that tracks QUIC connections
 /// to peers and hands them to the sync coordinator on demand.
+///
+/// Holds a mandatory [`FormationKey`] used to authenticate outgoing
+/// connections via HMAC challenge-response.
 pub struct MeshSyncTransport {
     endpoint: Endpoint,
     connections: RwLock<HashMap<EndpointId, Connection>>,
+    formation_key: FormationKey,
 }
 
 impl fmt::Debug for MeshSyncTransport {
@@ -54,10 +58,14 @@ impl fmt::Debug for MeshSyncTransport {
 
 impl MeshSyncTransport {
     /// Create a new transport sharing the given Iroh endpoint.
-    pub fn new(endpoint: Endpoint) -> Self {
+    ///
+    /// The `formation_key` is used to authenticate outgoing connections
+    /// via HMAC challenge-response before sync streams are opened.
+    pub fn new(endpoint: Endpoint, formation_key: FormationKey) -> Self {
         Self {
             endpoint,
             connections: RwLock::new(HashMap::new()),
+            formation_key,
         }
     }
 
@@ -205,6 +213,32 @@ impl MeshSyncTransport {
             .find(|p| p.is_selected())
             .and_then(|p| p.rtt())
     }
+
+    /// Establish an outgoing QUIC connection to a peer with mandatory
+    /// formation key authentication.
+    ///
+    /// Opens a `CAP_AUTOMERGE_ALPN` connection and runs the connector-side
+    /// HMAC challenge-response handshake before storing the connection.
+    pub async fn connect_and_authenticate(
+        &self,
+        peer_id: EndpointId,
+    ) -> anyhow::Result<Connection> {
+        let conn = self
+            .endpoint
+            .connect(peer_id, CAP_AUTOMERGE_ALPN)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to connect to peer: {e}"))?;
+
+        respond_to_formation_auth(&self.formation_key, &conn).await?;
+
+        info!(
+            peer = %peer_id.fmt_short(),
+            "outgoing sync connection authenticated via formation key"
+        );
+
+        self.insert_connection(peer_id, conn.clone());
+        Ok(conn)
+    }
 }
 
 #[async_trait]
@@ -212,6 +246,22 @@ impl SyncTransport for MeshSyncTransport {
     fn get_connection(&self, peer_id: &EndpointId) -> Option<Connection> {
         let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
         conns.get(peer_id).cloned()
+    }
+
+    /// Get an existing connection or establish a new authenticated one.
+    ///
+    /// Checks the cache first, pruning stale (closed) connections.
+    /// If no live connection exists, opens a new `CAP_AUTOMERGE_ALPN`
+    /// connection and runs formation key authentication.
+    async fn get_or_connect(&self, peer_id: &EndpointId) -> anyhow::Result<Connection> {
+        // Check cache, pruning closed connections
+        if let Some(conn) = self.get_connection(peer_id) {
+            if conn.close_reason().is_none() {
+                return Ok(conn);
+            }
+            self.remove_connection(peer_id);
+        }
+        self.connect_and_authenticate(*peer_id).await
     }
 
     fn connected_peers(&self) -> Vec<EndpointId> {
@@ -245,47 +295,31 @@ impl SyncTransport for MeshSyncTransport {
 pub struct SyncProtocolHandler {
     transport: Arc<MeshSyncTransport>,
     coordinator: Arc<AutomergeSyncCoordinator>,
-    /// Optional formation key for peer authentication.
-    /// When set, incoming connections must pass HMAC challenge-response
+    /// Formation key for peer authentication (mandatory).
+    /// All incoming connections must pass HMAC challenge-response
     /// before sync streams are accepted.
-    formation_key: Option<FormationKey>,
+    formation_key: FormationKey,
     /// Optional certificate bundle for Layer 2 peer validation.
-    /// When set, peers must have a valid, non-expired certificate.
+    /// When set, peers must have a valid, non-expired certificate
+    /// or the connection is rejected.
     certificate_bundle: Option<Arc<RwLock<crate::security::certificate::CertificateBundle>>>,
-    /// Whether to hard-reject peers without certificates (vs. warn-and-allow).
-    require_certificates: bool,
 }
 
 impl fmt::Debug for SyncProtocolHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SyncProtocolHandler")
-            .field("has_formation_key", &self.formation_key.is_some())
             .field("has_certificate_bundle", &self.certificate_bundle.is_some())
-            .field("require_certificates", &self.require_certificates)
             .finish()
     }
 }
 
 impl SyncProtocolHandler {
-    pub fn new(
-        transport: Arc<MeshSyncTransport>,
-        coordinator: Arc<AutomergeSyncCoordinator>,
-    ) -> Self {
-        Self {
-            transport,
-            coordinator,
-            formation_key: None,
-            certificate_bundle: None,
-            require_certificates: false,
-        }
-    }
-
-    /// Create a handler with formation key authentication enabled.
+    /// Create a new protocol handler with mandatory formation key authentication.
     ///
-    /// When a formation key is set, incoming connections must pass an
+    /// All incoming connections on `CAP_AUTOMERGE_ALPN` must pass an
     /// HMAC-SHA256 challenge-response handshake before sync begins.
     /// Connections that fail authentication are rejected.
-    pub fn with_formation_key(
+    pub fn new(
         transport: Arc<MeshSyncTransport>,
         coordinator: Arc<AutomergeSyncCoordinator>,
         formation_key: FormationKey,
@@ -293,23 +327,21 @@ impl SyncProtocolHandler {
         Self {
             transport,
             coordinator,
-            formation_key: Some(formation_key),
+            formation_key,
             certificate_bundle: None,
-            require_certificates: false,
         }
     }
 
     /// Enable Layer 2 certificate validation.
     ///
-    /// When `require` is true, peers without a valid certificate in the bundle
-    /// are rejected. When false, a warning is logged but the connection proceeds.
+    /// When a certificate bundle is set, peers without a valid certificate
+    /// are rejected. There is no warn-and-allow mode — certificates are
+    /// either enforced or not configured.
     pub fn with_certificate_bundle(
         mut self,
         bundle: Arc<RwLock<crate::security::certificate::CertificateBundle>>,
-        require: bool,
     ) -> Self {
         self.certificate_bundle = Some(bundle);
-        self.require_certificates = require;
         self
     }
 }
@@ -320,15 +352,13 @@ impl iroh::protocol::ProtocolHandler for SyncProtocolHandler {
     /// Authentication layers (in order):
     /// 1. **Certificate validation** (Layer 2): If a certificate bundle is
     ///    configured, the peer's EndpointId is checked against known certificates.
-    /// 2. **Formation key** (Layer 0+): If configured, runs HMAC-SHA256
-    ///    challenge-response handshake.
-    ///
-    /// Connections failing either check are rejected (or warned, depending on
-    /// `require_certificates`).
+    ///    Peers without valid certificates are rejected.
+    /// 2. **Formation key** (mandatory): Runs HMAC-SHA256 challenge-response
+    ///    handshake. Connections that fail are rejected.
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();
 
-        // Layer 2: Certificate validation
+        // Layer 2: Certificate validation (hard-reject when configured)
         if let Some(ref bundle) = self.certificate_bundle {
             let bundle = bundle.read().unwrap_or_else(|e| e.into_inner());
             let now = std::time::SystemTime::now()
@@ -338,44 +368,30 @@ impl iroh::protocol::ProtocolHandler for SyncProtocolHandler {
             let peer_valid = bundle.validate_peer(peer.as_bytes(), now);
 
             if !peer_valid {
-                if self.require_certificates {
-                    warn!(
-                        peer = %peer.fmt_short(),
-                        "peer has no valid certificate, rejecting sync connection"
-                    );
-                    connection.close(2u32.into(), b"certificate required");
-                    return Ok(());
-                }
-                debug!(
+                warn!(
                     peer = %peer.fmt_short(),
-                    "peer has no valid certificate (warn-and-allow mode)"
+                    "peer has no valid certificate, rejecting sync connection"
                 );
-            } else {
-                debug!(peer = %peer.fmt_short(), "peer certificate validated");
+                connection.close(2u32.into(), b"certificate required");
+                return Ok(());
             }
+            debug!(peer = %peer.fmt_short(), "peer certificate validated");
         }
 
-        // Formation key authentication
-        if let Some(ref fk) = self.formation_key {
-            match Self::run_formation_auth(fk, &connection).await {
-                Ok(()) => {
-                    info!(peer = %peer.fmt_short(), "peer authenticated via formation key");
-                }
-                Err(e) => {
-                    warn!(
-                        peer = %peer.fmt_short(),
-                        error = %e,
-                        "peer failed formation key authentication, rejecting"
-                    );
-                    connection.close(1u32.into(), b"formation auth failed");
-                    return Ok(());
-                }
+        // Formation key authentication (mandatory)
+        match Self::run_formation_auth(&self.formation_key, &connection).await {
+            Ok(()) => {
+                info!(peer = %peer.fmt_short(), "peer authenticated via formation key");
             }
-        } else {
-            info!(
-                peer = %peer.fmt_short(),
-                "accepted sync connection (no formation key configured)"
-            );
+            Err(e) => {
+                warn!(
+                    peer = %peer.fmt_short(),
+                    error = %e,
+                    "peer failed formation key authentication, rejecting"
+                );
+                connection.close(1u32.into(), b"formation auth failed");
+                return Ok(());
+            }
         }
 
         self.transport
@@ -534,6 +550,11 @@ pub async fn respond_to_formation_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Create a test `FormationKey` for use in unit tests.
+    fn test_formation_key() -> FormationKey {
+        FormationKey::new("test-formation", &[42u8; 32])
+    }
 
     #[test]
     fn test_formation_auth_timeout_is_reasonable() {
@@ -725,7 +746,7 @@ mod tests {
     async fn test_peer_paths_returns_paths_for_connected_peer() {
         let (endpoint_a, endpoint_b, conn) = create_connected_endpoints().await;
 
-        let transport = MeshSyncTransport::new(endpoint_b.clone());
+        let transport = MeshSyncTransport::new(endpoint_b.clone(), test_formation_key());
         let peer_id = conn.remote_id();
         transport.insert_connection(peer_id, conn);
 
@@ -756,7 +777,7 @@ mod tests {
             .await
             .unwrap();
 
-        let transport = MeshSyncTransport::new(endpoint.clone());
+        let transport = MeshSyncTransport::new(endpoint.clone(), test_formation_key());
         let unknown_peer = iroh::SecretKey::from_bytes(&[99u8; 32]).public();
 
         assert!(transport.peer_paths(&unknown_peer).is_none());
@@ -770,7 +791,7 @@ mod tests {
     async fn test_peer_rtt_returns_value_for_connected_peer() {
         let (endpoint_a, endpoint_b, conn) = create_connected_endpoints().await;
 
-        let transport = MeshSyncTransport::new(endpoint_b.clone());
+        let transport = MeshSyncTransport::new(endpoint_b.clone(), test_formation_key());
         let peer_id = conn.remote_id();
         transport.insert_connection(peer_id, conn);
 
@@ -799,7 +820,7 @@ mod tests {
     async fn test_path_info_type_detection() {
         let (endpoint_a, endpoint_b, conn) = create_connected_endpoints().await;
 
-        let transport = MeshSyncTransport::new(endpoint_b.clone());
+        let transport = MeshSyncTransport::new(endpoint_b.clone(), test_formation_key());
         let peer_id = conn.remote_id();
         transport.insert_connection(peer_id, conn);
 
