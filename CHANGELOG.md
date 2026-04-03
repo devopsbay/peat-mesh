@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-04-03
+
+### Fixed
+
+- Formation auth handshake deadlock over iroh 0.97 connections (#759).
+  `accept_bi()` requires the opener to write before the peer can accept the
+  stream — the initiator now sends a `FORMATION_AUTH_VERSION` preamble byte
+  immediately after `open_bi()`, unblocking the acceptor.
+
+### Added
+
+- Integration tests for formation auth handshake over live iroh connections
+  (successful auth and wrong-key rejection).
+
 ## [0.8.0] - 2026-04-02
 
 ### Security
