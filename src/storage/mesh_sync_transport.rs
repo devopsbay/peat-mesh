@@ -28,6 +28,14 @@ use crate::security::formation_key::{
 /// Timeout for formation key authentication handshake reads and writes.
 const FORMATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Version byte sent by the initiator to unblock `accept_bi()`.
+///
+/// iroh 0.97's `accept_bi()` will not return until the opener writes at
+/// least one byte to the send stream.  This constant is the first byte the
+/// initiator sends so the acceptor can detect the auth stream and,
+/// in the future, negotiate protocol versions.
+const FORMATION_AUTH_VERSION: u8 = 1;
+
 // ────────────────────────────────────────────────────────────────────────────
 // MeshSyncTransport
 // ────────────────────────────────────────────────────────────────────────────
@@ -412,12 +420,23 @@ impl SyncProtocolHandler {
     /// Returns `Ok(())` on successful authentication.
     async fn run_formation_auth(fk: &FormationKey, connection: &Connection) -> anyhow::Result<()> {
         // Acceptor waits for the connector to open the auth stream.
+        // iroh 0.97: `accept_bi()` blocks until the opener writes at least
+        // one byte, so the initiator sends a version byte first.
         let (mut send, mut recv) =
             tokio::time::timeout(FORMATION_AUTH_TIMEOUT, connection.accept_bi())
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!("formation auth timed out waiting for auth stream")
                 })??;
+
+        // Read and validate the version byte sent by the initiator.
+        let mut version = [0u8; 1];
+        tokio::time::timeout(FORMATION_AUTH_TIMEOUT, recv.read_exact(&mut version))
+            .await
+            .map_err(|_| anyhow::anyhow!("formation auth timed out reading version"))??;
+        if version[0] != FORMATION_AUTH_VERSION {
+            anyhow::bail!("unsupported formation auth version: {}", version[0]);
+        }
 
         // Send challenge
         let (nonce, _expected) = fk.create_challenge();
@@ -494,6 +513,15 @@ pub async fn respond_to_formation_auth(
         .await
         .map_err(|_| anyhow::anyhow!("formation auth timed out opening auth stream"))??;
 
+    // Write version byte so the acceptor's `accept_bi()` can complete.
+    // iroh 0.97 requires the opener to write before the peer can accept.
+    tokio::time::timeout(
+        FORMATION_AUTH_TIMEOUT,
+        send.write_all(&[FORMATION_AUTH_VERSION]),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("formation auth timed out sending version"))??;
+
     // Read challenge from acceptor
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(FORMATION_AUTH_TIMEOUT, recv.read_exact(&mut len_buf))
@@ -550,6 +578,7 @@ pub async fn respond_to_formation_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::protocol::Router;
 
     /// Create a test `FormationKey` for use in unit tests.
     fn test_formation_key() -> FormationKey {
@@ -831,6 +860,168 @@ mod tests {
             let is_relay = path.is_relay();
             assert!(is_ip || is_relay, "Path should be either IP or relay");
         }
+
+        endpoint_a.close().await;
+        endpoint_b.close().await;
+    }
+
+    // ---- Formation auth handshake integration tests ----
+
+    /// Helper: set up two iroh endpoints where endpoint_a runs a protocol
+    /// handler that performs the acceptor-side formation auth, and return
+    /// the connection from endpoint_b (the initiator).
+    async fn create_formation_auth_endpoints(
+        fk: FormationKey,
+    ) -> (
+        Endpoint,
+        Endpoint,
+        Connection,
+        Arc<std::sync::atomic::AtomicBool>,
+        Router,
+    ) {
+        use crate::storage::sync_transport::CAP_AUTOMERGE_ALPN;
+        use iroh::address_lookup::memory::MemoryLookup;
+        use iroh::protocol::Router;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let authenticated = Arc::new(AtomicBool::new(false));
+
+        // Protocol handler that runs the acceptor-side formation auth.
+        #[derive(Debug)]
+        struct AuthAcceptor {
+            fk: FormationKey,
+            authenticated: Arc<AtomicBool>,
+        }
+
+        impl iroh::protocol::ProtocolHandler for AuthAcceptor {
+            async fn accept(
+                &self,
+                connection: Connection,
+            ) -> Result<(), iroh::protocol::AcceptError> {
+                match SyncProtocolHandler::run_formation_auth(&self.fk, &connection).await {
+                    Ok(()) => {
+                        self.authenticated
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        connection.close(1u32.into(), b"formation auth failed");
+                        return Err(iroh::protocol::AcceptError::from_err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            e.to_string(),
+                        )));
+                    }
+                }
+                // Keep the connection alive so the verdict byte is delivered
+                // before the Router drops the Connection.  In production,
+                // SyncProtocolHandler::accept() hands off to
+                // start_sync_connection() which holds the connection open.
+                connection.closed().await;
+                Ok(())
+            }
+        }
+
+        let lookup_a = MemoryLookup::new();
+        let endpoint_a = Endpoint::empty_builder()
+            .address_lookup(lookup_a.clone())
+            .secret_key(iroh::SecretKey::from_bytes(&[30u8; 32]))
+            .bind()
+            .await
+            .unwrap();
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(
+                CAP_AUTOMERGE_ALPN,
+                AuthAcceptor {
+                    fk: fk.clone(),
+                    authenticated: authenticated.clone(),
+                },
+            )
+            .spawn();
+
+        let lookup_b = MemoryLookup::new();
+        let endpoint_b = Endpoint::empty_builder()
+            .address_lookup(lookup_b.clone())
+            .secret_key(iroh::SecretKey::from_bytes(&[31u8; 32]))
+            .bind()
+            .await
+            .unwrap();
+
+        lookup_b.add_endpoint_info(endpoint_a.addr());
+
+        let conn = endpoint_b
+            .connect(endpoint_a.id(), CAP_AUTOMERGE_ALPN)
+            .await
+            .unwrap();
+
+        (endpoint_a, endpoint_b, conn, authenticated, router_a)
+    }
+
+    /// Full formation auth handshake completes over a live iroh connection.
+    ///
+    /// This is the key regression test for peat#759: prior to the fix,
+    /// `accept_bi()` would deadlock because the initiator never wrote to
+    /// the send stream before reading.
+    #[tokio::test]
+    async fn test_formation_auth_handshake_over_iroh_connection() {
+        let fk = test_formation_key();
+        let (endpoint_a, endpoint_b, conn, authenticated, _router) =
+            create_formation_auth_endpoints(fk.clone()).await;
+
+        // Initiator runs the connector-side handshake.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            respond_to_formation_auth(&fk, &conn),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Handshake should complete within 10s (not deadlock)"
+        );
+        let inner = result.unwrap();
+        assert!(
+            inner.is_ok(),
+            "Handshake should succeed with matching keys: {:?}",
+            inner.unwrap_err()
+        );
+
+        // Give the acceptor a moment to store the flag.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            authenticated.load(std::sync::atomic::Ordering::SeqCst),
+            "Acceptor should have authenticated the peer"
+        );
+
+        endpoint_a.close().await;
+        endpoint_b.close().await;
+    }
+
+    /// Handshake fails when initiator uses a different formation key.
+    #[tokio::test]
+    async fn test_formation_auth_rejects_wrong_key() {
+        let acceptor_fk = test_formation_key();
+        let initiator_fk = FormationKey::new("wrong-formation", &[99u8; 32]);
+
+        let (endpoint_a, endpoint_b, conn, authenticated, _router) =
+            create_formation_auth_endpoints(acceptor_fk).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            respond_to_formation_auth(&initiator_fk, &conn),
+        )
+        .await;
+
+        assert!(result.is_ok(), "Should complete without deadlock");
+        // The initiator should get an error (either formation ID mismatch
+        // or rejection verdict).
+        assert!(
+            result.unwrap().is_err(),
+            "Handshake should fail with mismatched keys"
+        );
+        assert!(
+            !authenticated.load(std::sync::atomic::Ordering::SeqCst),
+            "Acceptor should NOT have authenticated the peer"
+        );
 
         endpoint_a.close().await;
         endpoint_b.close().await;
