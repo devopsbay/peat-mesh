@@ -47,9 +47,7 @@ use std::sync::Arc;
 
 /// Content-addressed blob identifier
 ///
-/// Blobs are identified by their cryptographic hash:
-/// - Ditto uses SHA256
-/// - iroh-blobs uses BLAKE3
+/// Blobs are identified by their cryptographic hash (BLAKE3 via iroh-blobs).
 ///
 /// The hash string format is backend-specific but always represents
 /// the content hash of the blob.
@@ -86,7 +84,7 @@ impl fmt::Display for BlobHash {
 /// be stored in CRDT documents to reference blob content.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlobToken {
-    /// Content hash (sha256 for Ditto, blake3 for Iroh)
+    /// Content hash (BLAKE3 via iroh-blobs)
     pub hash: BlobHash,
     /// Size in bytes (known at creation time)
     pub size_bytes: u64,
@@ -273,22 +271,13 @@ impl BlobHandle {
 
 /// Content-addressed blob storage trait
 ///
-/// Abstracts over backend-specific blob storage (Ditto Attachments, iroh-blobs).
+/// Abstracts over content-addressed blob storage (iroh-blobs).
 /// All blobs are content-addressed: the hash of the content serves as the ID.
 ///
 /// # Thread Safety
 ///
 /// All methods are safe to call from multiple threads. Implementations use
 /// appropriate synchronization internally.
-///
-/// # Backend Differences
-///
-/// | Feature | Ditto | iroh-blobs |
-/// |---------|-------|------------|
-/// | Hash Algorithm | SHA256 | BLAKE3 |
-/// | Metadata Storage | Native | External |
-/// | Sync Protocol | Attachment protocol | iroh-blobs protocol |
-/// | Garbage Collection | 10-minute TTL | Manual |
 ///
 /// # Example
 ///

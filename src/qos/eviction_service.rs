@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 pub struct StorageEvictionService {
     controller: Arc<EvictionController>,
     qos_storage: Arc<QoSAwareStorage>,
+    #[allow(dead_code)]
     store: Arc<AutomergeStore>,
     task_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
 }

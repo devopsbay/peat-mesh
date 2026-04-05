@@ -477,7 +477,7 @@ impl BlobStore for IrohBlobStore {
     }
 
     fn local_storage_bytes(&self) -> u64 {
-        // Sum up sizes from cache (matches DittoBlobStore behavior)
+        // Sum up sizes from cache
         // This represents logical storage used by blobs we know about,
         // regardless of whether they've been exported to disk yet.
         if let Ok(cache) = self.token_cache.read() {
@@ -547,6 +547,7 @@ impl FormationEndpointHooks {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl iroh::endpoint::EndpointHooks for FormationEndpointHooks {
     fn after_handshake<'a>(
         &'a self,
@@ -1539,30 +1540,53 @@ mod tests {
     }
 
     // ---- Integration tests ----
+    //
+    // QUIC tests must run sequentially to avoid port contention under parallel load.
+    static QUIC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Bind an iroh endpoint with a 10s timeout to prevent hangs under load.
+    async fn bind_test_endpoint(
+        lookup: iroh::address_lookup::memory::MemoryLookup,
+        secret_key: [u8; 32],
+    ) -> Endpoint {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            Endpoint::empty_builder()
+                .address_lookup(lookup)
+                .secret_key(iroh::SecretKey::from_bytes(&secret_key))
+                .bind(),
+        )
+        .await
+        .expect("endpoint bind timed out")
+        .unwrap()
+    }
+
+    /// Connect to an endpoint with a 10s timeout.
+    async fn connect_test_endpoint(
+        endpoint: &Endpoint,
+        peer_id: iroh::PublicKey,
+        alpn: &[u8],
+    ) -> iroh::endpoint::Connection {
+        tokio::time::timeout(Duration::from_secs(10), endpoint.connect(peer_id, alpn))
+            .await
+            .expect("connect timed out")
+            .unwrap()
+    }
 
     /// After a successful P2P fetch, the blob→peer mapping should be recorded in the index.
     #[tokio::test]
     async fn test_p2p_fetch_populates_index() {
+        let _lock = QUIC_TEST_LOCK.lock().await;
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
 
         // Build endpoints directly using empty_builder to avoid external
         // DNS/relay dependencies in tests.
         let memory_lookup_a = iroh::address_lookup::memory::MemoryLookup::new();
-        let endpoint_a = Endpoint::empty_builder()
-            .address_lookup(memory_lookup_a.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[1u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_a = bind_test_endpoint(memory_lookup_a.clone(), [1u8; 32]).await;
 
         let memory_lookup_b = iroh::address_lookup::memory::MemoryLookup::new();
-        let endpoint_b = Endpoint::empty_builder()
-            .address_lookup(memory_lookup_b.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[2u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_b = bind_test_endpoint(memory_lookup_b.clone(), [2u8; 32]).await;
 
         let store_a = NetworkedIrohBlobStore::from_endpoint_with_protocols(
             dir_a.path().to_path_buf(),
@@ -1609,26 +1633,17 @@ mod tests {
     /// `MemoryLookup`, one creates a blob, the other fetches it over QUIC.
     #[tokio::test]
     async fn test_p2p_blob_transfer() {
+        let _lock = QUIC_TEST_LOCK.lock().await;
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
 
         // Build endpoints directly using empty_builder to avoid external
         // DNS/relay dependencies in tests.
         let memory_lookup_a = iroh::address_lookup::memory::MemoryLookup::new();
-        let endpoint_a = Endpoint::empty_builder()
-            .address_lookup(memory_lookup_a.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[1u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_a = bind_test_endpoint(memory_lookup_a.clone(), [1u8; 32]).await;
 
         let memory_lookup_b = iroh::address_lookup::memory::MemoryLookup::new();
-        let endpoint_b = Endpoint::empty_builder()
-            .address_lookup(memory_lookup_b.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[2u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_b = bind_test_endpoint(memory_lookup_b.clone(), [2u8; 32]).await;
 
         let store_a = NetworkedIrohBlobStore::from_endpoint_with_protocols(
             dir_a.path().to_path_buf(),
@@ -1692,6 +1707,7 @@ mod tests {
     /// `EndpointHooks` fire on incoming connections when installed via the builder.
     #[tokio::test]
     async fn test_build_endpoint_with_custom_hooks() {
+        let _lock = QUIC_TEST_LOCK.lock().await;
         use iroh::protocol::Router;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1718,13 +1734,17 @@ mod tests {
         // Build endpoints directly using empty_builder to avoid external
         // DNS/relay dependencies in tests.
         let lookup_a = iroh::address_lookup::memory::MemoryLookup::new();
-        let endpoint_a = Endpoint::empty_builder()
-            .address_lookup(lookup_a.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[43u8; 32]))
-            .hooks(hooks)
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_a = tokio::time::timeout(
+            Duration::from_secs(10),
+            Endpoint::empty_builder()
+                .address_lookup(lookup_a.clone())
+                .secret_key(iroh::SecretKey::from_bytes(&[43u8; 32]))
+                .hooks(hooks)
+                .bind(),
+        )
+        .await
+        .expect("endpoint_a bind timed out")
+        .unwrap();
 
         // Minimal handler so Router accepts on this ALPN
         #[derive(Debug)]
@@ -1744,21 +1764,13 @@ mod tests {
 
         // Build a second endpoint and connect to the first to trigger the hook
         let lookup_b = iroh::address_lookup::memory::MemoryLookup::new();
-        let endpoint_b = Endpoint::empty_builder()
-            .address_lookup(lookup_b.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[44u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_b = bind_test_endpoint(lookup_b.clone(), [44u8; 32]).await;
 
         // Tell B about A's full endpoint address
         lookup_b.add_endpoint_info(endpoint_a.addr());
 
         // B connects to A — this triggers A's after_handshake hook
-        let conn = endpoint_b
-            .connect(endpoint_a.id(), b"test/hook/1")
-            .await
-            .unwrap();
+        let conn = connect_test_endpoint(&endpoint_b, endpoint_a.id(), b"test/hook/1").await;
 
         // Give the hook a moment to fire
         tokio::time::sleep(Duration::from_millis(100)).await;

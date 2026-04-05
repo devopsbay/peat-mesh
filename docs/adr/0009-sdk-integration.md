@@ -292,7 +292,7 @@ async def main():
     # Create and start an Peat node
     config = PeatConfig(
         platform_id="uav-001",
-        mesh_backend="automerge",  # or "ditto"
+        mesh_backend="automerge",
         transports=["iroh", "ble"],
     )
     
@@ -418,7 +418,7 @@ type PeatNode struct {
 // Config for creating a PeatNode
 type Config struct {
     PlatformID   string      `json:"platform_id"`
-    MeshBackend  string      `json:"mesh_backend"` // "automerge" or "ditto"
+    MeshBackend  string      `json:"mesh_backend"` // "automerge"
     Transports   []string    `json:"transports"`   // ["iroh", "ble"]
     BeaconInterval int       `json:"beacon_interval_secs"`
 }
@@ -620,10 +620,8 @@ pub struct PeatConfig {
 
 #[derive(Debug, Clone)]
 pub enum MeshBackend {
-    /// Open source Automerge + Iroh (recommended)
+    /// Automerge + Iroh (default)
     Automerge,
-    /// Commercial Ditto SDK
-    Ditto { app_id: String, token: String },
 }
 
 #[derive(Debug, Clone)]

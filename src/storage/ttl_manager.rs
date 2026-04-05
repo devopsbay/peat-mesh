@@ -22,7 +22,7 @@
 //!
 //! # Two-Layer TTL Strategy (ADR-002)
 //!
-//! **Ditto Layer**: Automatic eviction via Ditto SDK
+//! **Storage Layer**: Tombstone TTL-based eviction
 //! **Memory Layer**: Janitor cleanup for Automerge+Iroh (this module)
 //!
 //! # Usage Example

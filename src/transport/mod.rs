@@ -69,7 +69,7 @@ pub use btle::PeatBleTransport;
 /// Node identifier in the mesh network
 ///
 /// Uniquely identifies a node in the mesh. This is separate from
-/// backend-specific IDs (e.g., Iroh's EndpointId, Ditto's peer ID).
+/// backend-specific IDs (e.g., Iroh's EndpointId).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeId(String);
 

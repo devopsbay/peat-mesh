@@ -1,27 +1,17 @@
 //! TTL and Data Lifecycle Management
 //!
-//! Provides helpers for managing document lifecycle using Ditto's native deletion model:
+//! Provides helpers for managing document lifecycle:
 //! - **Soft-delete pattern**: Avoids husking on high-churn data (beacons, positions)
 //! - **EVICT helpers**: Local storage cleanup for edge devices
-//! - **Tombstone TTL config**: Configure Ditto's native tombstone reaping
+//! - **Tombstone TTL config**: Configure tombstone reaping interval
 //! - **Offline retention**: Connectivity-aware eviction policies
 //!
-//! ## Ditto's Deletion Model
+//! ## Deletion Model
 //!
-//! Ditto provides two deletion mechanisms:
+//! Two deletion mechanisms:
 //!
 //! 1. **DELETE/EVICT**: Creates tombstones that sync mesh-wide and auto-reap after `TOMBSTONE_TTL_HOURS`
 //! 2. **EVICT (local)**: Removes documents from local storage only (no tombstone, may re-sync)
-//!
-//! ### Tombstone TTL Configuration
-//!
-//! Set via `ALTER SYSTEM` or environment variables:
-//! ```sql
-//! ALTER SYSTEM SET TOMBSTONE_TTL_ENABLED = true
-//! ALTER SYSTEM SET TOMBSTONE_TTL_HOURS = 168  -- 7 days
-//! ```
-//!
-//! **Critical**: Never set Edge SDK TTL > Server TTL (Edge: 7 days, Cloud: 30 days)
 //!
 //! ## Architectural Challenges
 //!
@@ -62,21 +52,12 @@ use std::time::Duration;
 /// TTL configuration for data lifecycle management
 ///
 /// Provides collection-specific TTLs and eviction strategies that coordinate
-/// with Ditto's native tombstone TTL.
+/// with tombstone TTL-based reaping.
 #[derive(Debug, Clone)]
 pub struct TtlConfig {
-    /// Ditto tombstone TTL (hours)
+    /// Tombstone TTL (hours)
     ///
-    /// **Must be configured via ALTER SYSTEM or environment variable before heavy deletion workload**
-    ///
-    /// ```sql
-    /// ALTER SYSTEM SET TOMBSTONE_TTL_HOURS = 168
-    /// ```
-    ///
-    /// Or via environment variable:
-    /// ```bash
-    /// export TOMBSTONE_TTL_HOURS=168
-    /// ```
+    /// Controls how long tombstones persist before being reaped.
     pub tombstone_ttl_hours: u32,
 
     /// Enable automatic tombstone reaping
@@ -256,10 +237,7 @@ impl TtlConfig {
         self
     }
 
-    /// Set Ditto tombstone TTL (hours)
-    ///
-    /// **Warning**: This only configures the config struct. You must also
-    /// execute the ALTER SYSTEM command or set environment variable.
+    /// Set tombstone TTL (hours)
     pub fn with_tombstone_ttl(mut self, hours: u32) -> Self {
         self.tombstone_ttl_hours = hours;
         self
@@ -279,17 +257,10 @@ impl TtlConfig {
         }
     }
 
-    /// Generate ALTER SYSTEM commands for Ditto tombstone configuration
+    /// Generate ALTER SYSTEM commands for tombstone configuration
     ///
-    /// Returns DQL statements to configure Ditto's native tombstone TTL.
-    ///
-    /// **Usage**: Execute these via `DittoStore::execute()` before heavy deletion workload.
-    ///
-    /// ```ignore
-    /// for statement in config.ditto_alter_system_commands() {
-    ///     store.execute(&statement, serde_json::json!({})).await?;
-    /// }
-    /// ```
+    /// Returns statements to configure tombstone TTL reaping parameters.
+    #[deprecated(since = "0.9.0", note = "use tombstone_ttl_hours field directly")]
     pub fn ditto_alter_system_commands(&self) -> Vec<String> {
         vec![
             format!(
@@ -307,12 +278,10 @@ impl TtlConfig {
         ]
     }
 
-    /// Generate environment variable exports for Ditto configuration
+    /// Generate environment variable exports for tombstone configuration
     ///
-    /// Returns shell commands to set environment variables for scheduling parameters.
-    ///
-    /// **Note**: Scheduling parameters (REAPER_PREFERRED_HOUR) must be set via env vars
-    /// before starting Ditto, not at runtime.
+    /// Returns key-value pairs for tombstone reaping parameters.
+    #[deprecated(since = "0.9.0", note = "use tombstone_ttl_hours field directly")]
     pub fn ditto_env_vars(&self) -> HashMap<String, String> {
         let mut vars = HashMap::new();
         vars.insert(

@@ -1,7 +1,7 @@
 //! Storage backend trait abstraction
 //!
 //! This module defines the core traits for Peat mesh's storage layer,
-//! enabling runtime backend selection between Ditto, Automerge, RocksDB, etc.
+//! enabling runtime backend selection (Automerge is the default production backend).
 //!
 //! # Design Philosophy
 //!
@@ -42,9 +42,8 @@ pub type DocumentPredicate = Box<dyn Fn(&[u8]) -> bool + Send>;
 ///
 /// # Implementations
 ///
-/// - **DittoBackend**: Wraps existing Ditto SDK (proprietary, production-ready)
-/// - **AutomergeInMemoryBackend**: In-memory Automerge (POC, testing)
-/// - **RocksDbBackend**: RocksDB persistence (production target)
+/// - **AutomergeStore**: Automerge CRDT with redb persistence (production)
+/// - **InMemoryBackend**: In-memory store for testing
 ///
 /// # Thread Safety
 ///
@@ -277,8 +276,7 @@ pub trait Collection: Send + Sync {
     ///
     /// # Implementation Notes
     ///
-    /// - For Ditto: Uses geohash index (efficient)
-    /// - For RocksDB: Uses prefix scan (requires geohash in key)
+    /// - For Automerge/redb: Uses prefix scan (requires geohash in key)
     /// - For in-memory: Scans all documents (inefficient for large datasets)
     fn query_geohash_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>>;
 

@@ -45,7 +45,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 ///
 /// This trait defines the storage operations needed by the beacon system
 /// without coupling to any specific backend implementation. Implementations
-/// can use Ditto, in-memory storage, or any other CRDT-based system.
+/// can use Automerge, in-memory storage, or any other CRDT-based system.
 ///
 /// # Design Principles
 ///

@@ -95,7 +95,7 @@ name = "broker_service"
 required-features = ["automerge-backend", "broker"]
 
 [features]
-default = []
+default = ["automerge-backend"]
 lite-bridge = ["log", "dep:peat-lite"]
 bluetooth = ["dep:peat-btle"]
 automerge-backend = ["automerge", "iroh", "iroh-blobs", "redb", "lru", "negentropy", "rand", "tokio-stream"]

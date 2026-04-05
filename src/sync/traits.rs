@@ -7,7 +7,7 @@
 //! - `DataSyncBackend`: Lifecycle and composition
 //!
 //! These traits enable Peat mesh to work with multiple sync engines
-//! (Ditto, Automerge, custom implementations) without changing business logic.
+//! (Automerge, custom implementations) without changing business logic.
 
 use crate::sync::types::*;
 use anyhow::Result;
@@ -330,7 +330,7 @@ pub trait DataSyncBackend: Send + Sync {
 /// Information about a backend implementation
 #[derive(Debug, Clone)]
 pub struct BackendInfo {
-    /// Backend name (e.g., "Ditto", "Automerge")
+    /// Backend name (e.g., "Automerge", "InMemory")
     pub name: String,
 
     /// Backend version

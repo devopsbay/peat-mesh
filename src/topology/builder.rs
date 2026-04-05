@@ -102,7 +102,7 @@ pub struct TopologyConfig {
     pub hierarchy_strategy: Option<Arc<dyn HierarchyStrategy>>,
     /// Maximum lateral peer connections (None = unlimited)
     ///
-    /// For backends like Ditto that optimize mesh internally, set to None.
+    /// Set to None for unlimited connections.
     /// For explicit transports like Iroh, use a reasonable limit (e.g., 10-20)
     /// to avoid O(n²) connection overhead with large groups.
     pub max_lateral_connections: Option<usize>,

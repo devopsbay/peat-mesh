@@ -1,7 +1,7 @@
 //! Supporting types for data synchronization abstraction
 //!
 //! This module defines common types used across all sync backend implementations,
-//! providing a unified interface regardless of underlying CRDT engine (Ditto, Automerge, etc).
+//! providing a unified interface regardless of underlying CRDT engine.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ pub use serde_json::Value;
 /// Unified document representation across backends
 ///
 /// This provides a backend-agnostic view of documents, abstracting away
-/// differences between Ditto's CBOR documents and Automerge's columnar storage.
+/// differences between backend-specific document formats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     /// Optional document ID (None for new documents)
@@ -124,7 +124,7 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// Query abstraction that works across backends
 ///
 /// Provides a simple query language that can be translated to backend-specific
-/// query formats (Ditto DQL, Automerge queries, etc).
+/// query formats.
 ///
 /// # Spatial Queries (Issue #356)
 ///

@@ -192,10 +192,7 @@ impl AutomergeStore {
         self.put(key, doc)?;
 
         // Extract collection name from key prefix (handles both "col/id" and "col:id")
-        let collection = key
-            .find(|c| c == '/' || c == ':')
-            .map(|pos| &key[..pos])
-            .unwrap_or(key);
+        let collection = key.find(['/', ':']).map(|pos| &key[..pos]).unwrap_or(key);
 
         if let Some(ttl) = ttl_manager.config().get_collection_ttl(collection) {
             ttl_manager.set_ttl(key, ttl)?;

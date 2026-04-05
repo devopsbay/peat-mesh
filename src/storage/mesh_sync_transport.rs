@@ -126,24 +126,18 @@ impl MeshSyncTransport {
         let path_peer_id = peer_id;
         tokio::spawn(async move {
             let mut watcher = path_watcher;
-            loop {
-                match watcher.updated().await {
-                    Ok(path_list) => {
-                        let paths: Vec<_> = path_list.into_iter().collect();
-                        let selected = paths.iter().find(|p| p.is_selected());
-                        let path_type =
-                            selected.map(|p| if p.is_relay() { "relay" } else { "direct" });
-                        let rtt = selected.and_then(|p| p.rtt());
-                        info!(
-                            peer = %path_peer_id.fmt_short(),
-                            active_path = ?path_type,
-                            rtt = ?rtt,
-                            total_paths = paths.len(),
-                            "Connection paths changed"
-                        );
-                    }
-                    Err(_) => break, // Connection dropped
-                }
+            while let Ok(path_list) = watcher.updated().await {
+                let paths: Vec<_> = path_list.into_iter().collect();
+                let selected = paths.iter().find(|p| p.is_selected());
+                let path_type = selected.map(|p| if p.is_relay() { "relay" } else { "direct" });
+                let rtt = selected.and_then(|p| p.rtt());
+                info!(
+                    peer = %path_peer_id.fmt_short(),
+                    active_path = ?path_type,
+                    rtt = ?rtt,
+                    total_paths = paths.len(),
+                    "Connection paths changed"
+                );
             }
         });
 
@@ -714,16 +708,21 @@ mod tests {
     }
 
     // ---- Multipath / noq feature tests ----
+    //
+    // QUIC endpoint tests must run sequentially — parallel bind() calls
+    // compete for ports and cause intermittent timeouts under load.
+    static QUIC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Helper: create a pair of connected iroh endpoints for testing.
     ///
-    /// Returns (endpoint_a, endpoint_b, connection_from_b_to_a).
-    /// Uses Router on endpoint_a to handle incoming connections.
-    async fn create_connected_endpoints() -> (Endpoint, Endpoint, Connection) {
+    /// Returns (endpoint_a, endpoint_b, connection_from_b_to_a, router_handle).
+    /// The router handle must be kept alive for the duration of the test.
+    async fn create_connected_endpoints() -> (Endpoint, Endpoint, Connection, Router) {
         use iroh::address_lookup::memory::MemoryLookup;
         use iroh::protocol::Router;
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        let timeout = Duration::from_secs(10);
         let alpn: &[u8] = b"test/mesh/1";
 
         // Minimal protocol handler that just accepts
@@ -741,39 +740,51 @@ mod tests {
         // Build endpoints using empty_builder to avoid external DNS/relay
         // dependencies in tests.
         let lookup_a = MemoryLookup::new();
-        let endpoint_a = Endpoint::empty_builder()
-            .address_lookup(lookup_a.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[10u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_a = tokio::time::timeout(
+            timeout,
+            Endpoint::empty_builder()
+                .address_lookup(lookup_a.clone())
+                .secret_key(iroh::SecretKey::from_bytes(&[10u8; 32]))
+                .bind(),
+        )
+        .await
+        .expect("endpoint_a bind timed out")
+        .unwrap();
 
         // Router on A accepts incoming connections
-        let _router_a = Router::builder(endpoint_a.clone())
+        let router_a = Router::builder(endpoint_a.clone())
             .accept(alpn, AcceptAll(accepted.clone()))
             .spawn();
 
         let lookup_b = MemoryLookup::new();
-        let endpoint_b = Endpoint::empty_builder()
-            .address_lookup(lookup_b.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[11u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_b = tokio::time::timeout(
+            timeout,
+            Endpoint::empty_builder()
+                .address_lookup(lookup_b.clone())
+                .secret_key(iroh::SecretKey::from_bytes(&[11u8; 32]))
+                .bind(),
+        )
+        .await
+        .expect("endpoint_b bind timed out")
+        .unwrap();
 
         // Tell B about A's full endpoint address
         lookup_b.add_endpoint_info(endpoint_a.addr());
 
         // B connects to A
-        let conn = endpoint_b.connect(endpoint_a.id(), alpn).await.unwrap();
+        let conn = tokio::time::timeout(timeout, endpoint_b.connect(endpoint_a.id(), alpn))
+            .await
+            .expect("connect timed out")
+            .unwrap();
 
-        (endpoint_a, endpoint_b, conn)
+        (endpoint_a, endpoint_b, conn, router_a)
     }
 
     /// `peer_paths()` returns path info for a connected peer.
     #[tokio::test]
     async fn test_peer_paths_returns_paths_for_connected_peer() {
-        let (endpoint_a, endpoint_b, conn) = create_connected_endpoints().await;
+        let _lock = QUIC_TEST_LOCK.lock().await;
+        let (endpoint_a, endpoint_b, conn, _router) = create_connected_endpoints().await;
 
         let transport = MeshSyncTransport::new(endpoint_b.clone(), test_formation_key());
         let peer_id = conn.remote_id();
@@ -818,7 +829,8 @@ mod tests {
     /// `peer_rtt()` returns a duration for a connected peer.
     #[tokio::test]
     async fn test_peer_rtt_returns_value_for_connected_peer() {
-        let (endpoint_a, endpoint_b, conn) = create_connected_endpoints().await;
+        let _lock = QUIC_TEST_LOCK.lock().await;
+        let (endpoint_a, endpoint_b, conn, _router) = create_connected_endpoints().await;
 
         let transport = MeshSyncTransport::new(endpoint_b.clone(), test_formation_key());
         let peer_id = conn.remote_id();
@@ -847,7 +859,8 @@ mod tests {
     /// PathInfo exposes path type (relay vs direct) correctly.
     #[tokio::test]
     async fn test_path_info_type_detection() {
-        let (endpoint_a, endpoint_b, conn) = create_connected_endpoints().await;
+        let _lock = QUIC_TEST_LOCK.lock().await;
+        let (endpoint_a, endpoint_b, conn, _router) = create_connected_endpoints().await;
 
         let transport = MeshSyncTransport::new(endpoint_b.clone(), test_formation_key());
         let peer_id = conn.remote_id();
@@ -920,13 +933,19 @@ mod tests {
             }
         }
 
+        let timeout = Duration::from_secs(10);
+
         let lookup_a = MemoryLookup::new();
-        let endpoint_a = Endpoint::empty_builder()
-            .address_lookup(lookup_a.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[30u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_a = tokio::time::timeout(
+            timeout,
+            Endpoint::empty_builder()
+                .address_lookup(lookup_a.clone())
+                .secret_key(iroh::SecretKey::from_bytes(&[30u8; 32]))
+                .bind(),
+        )
+        .await
+        .expect("endpoint_a bind timed out")
+        .unwrap();
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(
@@ -939,19 +958,26 @@ mod tests {
             .spawn();
 
         let lookup_b = MemoryLookup::new();
-        let endpoint_b = Endpoint::empty_builder()
-            .address_lookup(lookup_b.clone())
-            .secret_key(iroh::SecretKey::from_bytes(&[31u8; 32]))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint_b = tokio::time::timeout(
+            timeout,
+            Endpoint::empty_builder()
+                .address_lookup(lookup_b.clone())
+                .secret_key(iroh::SecretKey::from_bytes(&[31u8; 32]))
+                .bind(),
+        )
+        .await
+        .expect("endpoint_b bind timed out")
+        .unwrap();
 
         lookup_b.add_endpoint_info(endpoint_a.addr());
 
-        let conn = endpoint_b
-            .connect(endpoint_a.id(), CAP_AUTOMERGE_ALPN)
-            .await
-            .unwrap();
+        let conn = tokio::time::timeout(
+            timeout,
+            endpoint_b.connect(endpoint_a.id(), CAP_AUTOMERGE_ALPN),
+        )
+        .await
+        .expect("connect timed out")
+        .unwrap();
 
         (endpoint_a, endpoint_b, conn, authenticated, router_a)
     }
@@ -963,6 +989,7 @@ mod tests {
     /// the send stream before reading.
     #[tokio::test]
     async fn test_formation_auth_handshake_over_iroh_connection() {
+        let _lock = QUIC_TEST_LOCK.lock().await;
         let fk = test_formation_key();
         let (endpoint_a, endpoint_b, conn, authenticated, _router) =
             create_formation_auth_endpoints(fk.clone()).await;
@@ -999,6 +1026,7 @@ mod tests {
     /// Handshake fails when initiator uses a different formation key.
     #[tokio::test]
     async fn test_formation_auth_rejects_wrong_key() {
+        let _lock = QUIC_TEST_LOCK.lock().await;
         let acceptor_fk = test_formation_key();
         let initiator_fk = FormationKey::new("wrong-formation", &[99u8; 32]);
 

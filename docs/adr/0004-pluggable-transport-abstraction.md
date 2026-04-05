@@ -55,7 +55,6 @@ How multiple transports are used together:
 **What exists today:**
 - `MeshTransport` trait in `peat-protocol/src/transport/mod.rs`
 - `IrohMeshTransport` implementing QUIC-based transport
-- `DittoMeshTransport` delegating to Ditto's transport
 - `HealthMonitor` for connection quality tracking
 
 **What's missing:**
