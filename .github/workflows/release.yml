@@ -44,7 +44,26 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Extract the section between this version's header and the next version header
+          NOTES=$(awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            echo "::warning::No CHANGELOG.md entry found for $VERSION, falling back to auto-generated notes"
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
+          else
+            # Write to file to preserve newlines
+            echo "$NOTES" > /tmp/release-notes.md
+            echo "fallback=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Create GitHub Release
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          if [ "${{ steps.changelog.outputs.fallback }}" = "true" ]; then
+            gh release create "$GITHUB_REF_NAME" --generate-notes
+          else
+            gh release create "$GITHUB_REF_NAME" --notes-file /tmp/release-notes.md
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
