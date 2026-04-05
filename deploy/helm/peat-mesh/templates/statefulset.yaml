@@ -44,6 +44,16 @@ spec:
             - name: PEAT_IROH_RELAY_URLS
               value: {{ .Values.irohRelayUrls | quote }}
             {{- end }}
+            - name: PEAT_COMPACTION_ENABLED
+              value: {{ .Values.compaction.enabled | quote }}
+            - name: PEAT_COMPACTION_INTERVAL_SECS
+              value: {{ .Values.compaction.intervalSecs | quote }}
+            - name: PEAT_COMPACTION_THRESHOLD_BYTES
+              value: {{ .Values.compaction.thresholdBytes | quote }}
+            {{- if .Values.compaction.collections }}
+            - name: PEAT_COMPACTION_COLLECTIONS
+              value: {{ .Values.compaction.collections | quote }}
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.rustLog | quote }}
           livenessProbe:

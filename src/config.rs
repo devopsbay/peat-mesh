@@ -59,6 +59,50 @@ pub struct MeshConfig {
     pub transport_manager: Option<TransportManagerConfig>,
     /// Iroh networking configuration.
     pub iroh: IrohConfig,
+    /// Automerge CRDT compaction configuration.
+    pub compaction: CompactionConfig,
+}
+
+/// Configuration for periodic Automerge document compaction.
+///
+/// Compaction discards CRDT revision history via `fork()`, keeping only the
+/// current document state. This bounds memory growth on long-running nodes
+/// at the cost of a full-state sync on the next peer exchange.
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
+    /// Enable automatic background compaction. Default: `false`.
+    pub enabled: bool,
+    /// How often the compaction sweep runs. Default: 5 minutes.
+    /// Clamped to a minimum of 10 seconds to prevent busy-looping.
+    pub interval: Duration,
+    /// Only compact documents larger than this threshold. Default: 64 KiB.
+    pub size_threshold_bytes: usize,
+    /// Collections to compact. When empty and compaction is enabled,
+    /// auto-derives from `SyncModeRegistry` (all `LatestOnly` collections).
+    /// Only `LatestOnly` collections are safe to compact — compacting
+    /// `FullHistory` collections destroys change history needed for delta sync.
+    pub collections: Vec<String>,
+}
+
+/// Minimum compaction interval to prevent busy-looping (10 seconds).
+const MIN_COMPACTION_INTERVAL: Duration = Duration::from_secs(10);
+
+impl CompactionConfig {
+    /// Returns the effective interval, clamped to at least 10 seconds.
+    pub fn effective_interval(&self) -> Duration {
+        self.interval.max(MIN_COMPACTION_INTERVAL)
+    }
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: Duration::from_secs(300),
+            size_threshold_bytes: 64 * 1024,
+            collections: Vec::new(),
+        }
+    }
 }
 
 /// Discovery settings for mesh peer discovery.
@@ -316,5 +360,113 @@ mod tests {
         let cfg = SecurityConfig::default();
         let debug = format!("{:?}", cfg);
         assert!(debug.contains("SecurityConfig"));
+    }
+
+    // ── CompactionConfig defaults ────────────────────────────────
+
+    #[test]
+    fn test_compaction_config_default_disabled() {
+        let cfg = CompactionConfig::default();
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn test_compaction_config_default_interval() {
+        let cfg = CompactionConfig::default();
+        assert_eq!(cfg.interval, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_compaction_config_default_threshold() {
+        let cfg = CompactionConfig::default();
+        assert_eq!(cfg.size_threshold_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn test_compaction_config_custom() {
+        let cfg = CompactionConfig {
+            enabled: true,
+            interval: Duration::from_secs(60),
+            size_threshold_bytes: 1024,
+            collections: vec!["beacons".to_string()],
+        };
+        assert!(cfg.enabled);
+        assert_eq!(cfg.interval, Duration::from_secs(60));
+        assert_eq!(cfg.size_threshold_bytes, 1024);
+        assert_eq!(cfg.collections.len(), 1);
+    }
+
+    #[test]
+    fn test_compaction_config_clone() {
+        let cfg = CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.enabled, cfg.enabled);
+        assert_eq!(cloned.interval, cfg.interval);
+    }
+
+    #[test]
+    fn test_compaction_config_debug() {
+        let cfg = CompactionConfig::default();
+        let debug = format!("{:?}", cfg);
+        assert!(debug.contains("CompactionConfig"));
+    }
+
+    #[test]
+    fn test_mesh_config_default_compaction() {
+        let cfg = MeshConfig::default();
+        assert!(!cfg.compaction.enabled);
+        assert_eq!(cfg.compaction.interval, Duration::from_secs(300));
+        assert!(cfg.compaction.collections.is_empty());
+    }
+
+    #[test]
+    fn test_compaction_config_zero_interval_clamped() {
+        let cfg = CompactionConfig {
+            interval: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_interval(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_compaction_config_tiny_interval_clamped() {
+        let cfg = CompactionConfig {
+            interval: Duration::from_secs(3),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_interval(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_compaction_config_large_interval_unchanged() {
+        let cfg = CompactionConfig {
+            interval: Duration::from_secs(600),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_interval(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_compaction_config_exactly_min_interval() {
+        let cfg = CompactionConfig {
+            interval: Duration::from_secs(10),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_interval(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_compaction_config_with_collections() {
+        let cfg = CompactionConfig {
+            enabled: true,
+            collections: vec!["beacons".to_string(), "platforms".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.enabled);
+        assert_eq!(cfg.collections.len(), 2);
+        assert_eq!(cfg.collections[0], "beacons");
     }
 }

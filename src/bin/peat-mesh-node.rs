@@ -5,7 +5,7 @@
 //! serves the broker HTTP/WS API until SIGTERM/SIGINT.
 
 use peat_mesh::broker::{Broker, BrokerConfig, OtaAppState};
-use peat_mesh::config::{IrohConfig, MeshConfig};
+use peat_mesh::config::{CompactionConfig, IrohConfig, MeshConfig};
 use peat_mesh::discovery::{KubernetesDiscovery, KubernetesDiscoveryConfig};
 use peat_mesh::mesh::PeatMeshBuilder;
 use peat_mesh::peer_connector::PeerConnector;
@@ -105,6 +105,29 @@ async fn run() -> anyhow::Result<()> {
         key
     };
 
+    // ── Compaction config ────────────────────────────────────────
+    let compaction_enabled: bool = std::env::var("PEAT_COMPACTION_ENABLED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(false); // Disabled by default
+    let compaction_interval_secs: u64 = std::env::var("PEAT_COMPACTION_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let compaction_threshold_bytes: usize = std::env::var("PEAT_COMPACTION_THRESHOLD_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64 * 1024);
+    let compaction_collections: Vec<String> = std::env::var("PEAT_COMPACTION_COLLECTIONS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
     // ── Mesh config ──────────────────────────────────────────────
     let mesh_config = MeshConfig {
         node_id: Some(hostname.clone()),
@@ -113,6 +136,12 @@ async fn run() -> anyhow::Result<()> {
             relay_urls,
             secret_key: Some(iroh_key),
             ..Default::default()
+        },
+        compaction: CompactionConfig {
+            enabled: compaction_enabled,
+            interval: std::time::Duration::from_secs(compaction_interval_secs),
+            size_threshold_bytes: compaction_threshold_bytes,
+            collections: compaction_collections,
         },
         ..Default::default()
     };
@@ -311,6 +340,57 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    // ── Background compaction (sync-mode-aware, Issue #760) ─────
+    let compaction_token = tokio_util::sync::CancellationToken::new();
+    if mesh_config.compaction.enabled {
+        let registry = coordinator.sync_mode_registry();
+
+        // Resolve collection list: explicit config or auto-derive from LatestOnly sync modes
+        let compaction_collections = if mesh_config.compaction.collections.is_empty() {
+            let all = registry.all_overrides();
+            let auto: Vec<String> = all
+                .into_iter()
+                .filter(|(_, mode)| mode.is_latest_only())
+                .map(|(name, _)| name)
+                .collect();
+            info!(collections = ?auto, "Auto-derived compaction collections from LatestOnly sync modes");
+            auto
+        } else {
+            mesh_config.compaction.collections.clone()
+        };
+
+        // Safety check: warn if compacting non-LatestOnly collections
+        for collection in &compaction_collections {
+            if !registry.is_latest_only(collection) {
+                warn!(
+                    collection = %collection,
+                    sync_mode = %registry.get(collection),
+                    "Compacting a non-LatestOnly collection destroys change history needed for delta sync"
+                );
+            }
+        }
+
+        if compaction_collections.is_empty() {
+            info!("Compaction enabled but no eligible collections found; skipping");
+        } else {
+            let effective_interval = mesh_config.compaction.effective_interval();
+            automerge_store.start_background_compaction(
+                effective_interval,
+                mesh_config.compaction.size_threshold_bytes,
+                compaction_collections.clone(),
+                compaction_token.clone(),
+            );
+            info!(
+                interval_secs = effective_interval.as_secs(),
+                threshold_bytes = mesh_config.compaction.size_threshold_bytes,
+                collections = ?compaction_collections,
+                "Background compaction started (per-collection)"
+            );
+        }
+    } else {
+        info!("Background compaction disabled");
     }
 
     // ── Sync protocol handler (for incoming QUIC connections) ───
@@ -583,6 +663,7 @@ async fn run() -> anyhow::Result<()> {
     info!("Shutting down...");
     let _ = sync_cancel_tx.send(true);
     let _ = ota_cancel_tx.send(true);
+    compaction_token.cancel();
     ttl_manager.stop_background_cleanup();
     gc.stop();
     gc_handle.abort();

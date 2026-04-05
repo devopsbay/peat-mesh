@@ -23,6 +23,14 @@ irohRelayUrls: ""
 # RUST_LOG filter
 rustLog: "info,peat_mesh=debug"
 
+# Automerge CRDT compaction (per-collection, sync-mode-aware)
+# Only safe for LatestOnly sync-mode collections. Disabled by default.
+compaction:
+  enabled: false       # Set true to enable per-collection compaction
+  intervalSecs: 300    # Sweep interval in seconds (minimum: 10)
+  thresholdBytes: 65536  # Only compact documents larger than this (bytes)
+  collections: ""      # Comma-separated collections (empty = auto-derive from LatestOnly sync modes)
+
 serviceAccount:
   create: true
   name: ""

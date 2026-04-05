@@ -36,6 +36,10 @@ The `node` meta-feature enables: `automerge-backend` + `broker` + `kubernetes` +
 | `PEAT_BROKER_PORT` | No | `8081` | HTTP/WS broker listen port |
 | `PEAT_IROH_BIND_PORT` | No | `11204` | Iroh QUIC (UDP) listen port |
 | `PEAT_IROH_RELAY_URLS` | No | — | Comma-separated Iroh relay URLs for NAT traversal |
+| `PEAT_COMPACTION_ENABLED` | No | `false` | Enable per-collection Automerge CRDT compaction |
+| `PEAT_COMPACTION_INTERVAL_SECS` | No | `300` | Seconds between compaction sweeps (minimum: 10) |
+| `PEAT_COMPACTION_THRESHOLD_BYTES` | No | `65536` | Only compact documents larger than this (bytes) |
+| `PEAT_COMPACTION_COLLECTIONS` | No | — | Comma-separated collections to compact (empty = auto-derive from LatestOnly sync modes) |
 | `RUST_LOG` | No | `info,peat_mesh=debug` | Tracing filter |
 
 ### Running locally
@@ -116,6 +120,11 @@ brokerPort: 8081                   # Broker HTTP/WS port
 irohBindPort: 11204                # Iroh QUIC UDP port
 irohRelayUrls: ""                  # Comma-separated relay URLs
 rustLog: "info,peat_mesh=debug"    # Tracing filter
+compaction:
+  enabled: false                   # Per-collection CRDT compaction (off by default)
+  intervalSecs: 300                # Sweep interval (minimum: 10)
+  thresholdBytes: 65536            # Only compact docs above this size
+  collections: ""                  # Comma-separated collections (empty = auto-derive from LatestOnly)
 resources:
   requests:
     cpu: 100m
@@ -259,6 +268,47 @@ kubectl logs peat-mesh-0 | grep -E "automerge|blob store ready"
 # Opening redb database with cache_size=16777216 bytes
 # Iroh blob store ready (blobs + automerge sync) iroh_endpoint_id=c25a10ed6e
 ```
+
+### Automerge compaction
+
+Background compaction prevents unbounded memory growth from CRDT revision history accumulation. This is critical for long-running nodes and memory-constrained devices (e.g., ATAK on Android).
+
+Compaction uses Automerge's `fork()` to discard change history, keeping only the current document state. **This destroys the change history needed for incremental delta sync**, so compaction is only safe for `LatestOnly` sync-mode collections (which already send full state). `FullHistory` collections are never compacted.
+
+**Compaction is disabled by default.** When enabled with no explicit collection list, it auto-derives the safe set from the `SyncModeRegistry` (all `LatestOnly` collections: beacons, platforms, tracks, nodes, cells, node_states, etc.).
+
+**Enable with auto-derived collections (recommended):**
+
+```bash
+PEAT_COMPACTION_ENABLED=true
+# Auto-derives from LatestOnly sync modes — no PEAT_COMPACTION_COLLECTIONS needed
+```
+
+**Explicit collection list:**
+
+```bash
+PEAT_COMPACTION_ENABLED=true
+PEAT_COMPACTION_COLLECTIONS=beacons,platforms,node_states
+```
+
+**Aggressive for mobile/ATAK:**
+
+```bash
+PEAT_COMPACTION_ENABLED=true
+PEAT_COMPACTION_INTERVAL_SECS=60
+PEAT_COMPACTION_THRESHOLD_BYTES=16384
+```
+
+Verify compaction is running in the logs:
+
+```bash
+kubectl logs peat-mesh-0 | grep "compaction"
+# Auto-derived compaction collections from LatestOnly sync modes collections=["beacons", "platforms", ...]
+# Background compaction started (per-collection) interval_secs=300 threshold_bytes=65536 collections=[...]
+# background compaction complete count=3 before=245760 after=12288
+```
+
+A warning is logged at startup if a compaction collection uses a non-LatestOnly sync mode.
 
 ### EndpointSlice
 

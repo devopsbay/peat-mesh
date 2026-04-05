@@ -13,7 +13,7 @@ Core capabilities:
 - **Discovery** - mDNS and static peer discovery with hybrid strategies
 - **Topology** - Dynamic topology management with partition detection and autonomous operation
 - **Routing** - Mesh routing with data aggregation and deduplication
-- **Storage** - Automerge CRDT backend with Iroh P2P sync, negentropy set reconciliation, redb persistence, and streaming large-blob transfer
+- **Storage** - Automerge CRDT backend with Iroh P2P sync, negentropy set reconciliation, redb persistence, streaming large-blob transfer, and per-collection CRDT compaction
 - **Beacon** - Geographic beacon broadcasting and observation with geohash indexing
 - **QoS** - Bandwidth management, TTL, retention policies, sync modes, and garbage collection
 - **Broker** - Optional HTTP/WebSocket service broker (Axum-based)
@@ -78,6 +78,27 @@ let checkpoint = TransferCheckpoint::load("transfer-session.json")?;
 | `datacenter()` | 1 MiB | 60s | High-bandwidth, reliable links |
 | `tactical()` | 256 KiB | 30s | Intermittent tactical networks |
 | `edge()` | 64 KiB | 10s | Low-bandwidth edge/BTLE links |
+
+## CRDT Compaction
+
+Long-running nodes accumulate Automerge revision history that grows unbounded, eventually causing OOM on memory-constrained devices like ATAK/Android. Per-collection compaction addresses this by periodically discarding change history via `fork()` for collections that don't need it.
+
+**Compaction is sync-mode-aware.** It only runs on `LatestOnly` collections (beacons, platforms, tracks, node_states, etc.) which already send full document state during sync. `FullHistory` collections (commands, audit_logs) are never compacted — their change history is needed for incremental delta sync.
+
+```bash
+# Enable with auto-derived safe collections
+PEAT_COMPACTION_ENABLED=true
+
+# Or specify explicit collections
+PEAT_COMPACTION_ENABLED=true
+PEAT_COMPACTION_COLLECTIONS=beacons,platforms,node_states
+
+# Tune for mobile/tactical (more aggressive)
+PEAT_COMPACTION_INTERVAL_SECS=60
+PEAT_COMPACTION_THRESHOLD_BYTES=16384
+```
+
+Compaction is disabled by default. See the [Deployment Guide](docs/deployment.md#automerge-compaction) for full configuration details.
 
 ## Kubernetes Deployment
 

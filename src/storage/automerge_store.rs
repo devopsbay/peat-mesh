@@ -694,6 +694,12 @@ impl AutomergeStore {
     /// }
     /// ```
     pub fn compact(&self, key: &str) -> Result<Option<(usize, usize)>> {
+        // NOTE: This is a non-atomic read-modify-write. If a concurrent
+        // receive_sync_message() applies changes between get() and
+        // put_without_notify(), those changes will be silently dropped.
+        // The 5-minute default interval makes this window narrow, and
+        // lost changes will be re-synced on the next polling round (5s).
+        // See: https://github.com/defenseunicorns/peat-mesh/issues/74
         let doc = match self.get(key)? {
             Some(d) => d,
             None => return Ok(None),
@@ -850,17 +856,20 @@ impl AutomergeStore {
         Ok((count, total_before, total_after))
     }
 
-    /// Start a background task that periodically compacts documents exceeding
-    /// a size threshold.
+    /// Start a background task that periodically compacts documents in
+    /// specific collections that exceed a size threshold.
+    ///
+    /// Only `LatestOnly` sync-mode collections should be compacted — compacting
+    /// `FullHistory` collections destroys change history needed for delta sync.
     ///
     /// - `interval`: How often to run compaction (default: 5 minutes)
     /// - `size_threshold_bytes`: Only compact documents larger than this (default: 64 KiB)
-    ///
-    /// This prevents unbounded Automerge history growth on long-running nodes.
+    /// - `collections`: Collection prefixes to compact (e.g., `["beacons", "platforms"]`)
     pub fn start_background_compaction(
         self: &Arc<Self>,
         interval: std::time::Duration,
         size_threshold_bytes: usize,
+        collections: Vec<String>,
         token: tokio_util::sync::CancellationToken,
     ) {
         let store = Arc::clone(self);
@@ -876,7 +885,7 @@ impl AutomergeStore {
                         break;
                     }
                     _ = timer.tick() => {
-                        match store.compact_above_threshold(size_threshold_bytes) {
+                        match store.compact_collections_above_threshold(&collections, size_threshold_bytes) {
                             Ok((count, before, after)) => {
                                 if count > 0 {
                                     tracing::info!(count, before, after, "background compaction complete");
@@ -890,6 +899,39 @@ impl AutomergeStore {
                 }
             }
         });
+    }
+
+    /// Compact documents in specific collections that exceed a size threshold.
+    ///
+    /// Only scans documents matching the given collection prefixes (e.g.,
+    /// `"beacons"` matches `"beacons:beacon-1"`, `"beacons:beacon-2"`, etc.).
+    ///
+    /// Returns `(documents_compacted, total_bytes_before, total_bytes_after)`.
+    pub fn compact_collections_above_threshold(
+        &self,
+        collections: &[String],
+        threshold_bytes: usize,
+    ) -> Result<(usize, usize, usize)> {
+        let mut count = 0;
+        let mut total_before = 0;
+        let mut total_after = 0;
+
+        for collection in collections {
+            let prefix = format!("{}:", collection);
+            let docs = self.scan_prefix(&prefix)?;
+            for (key, _) in docs {
+                let size = self.document_size(&key)?.unwrap_or(0);
+                if size >= threshold_bytes {
+                    if let Some((before, after)) = self.compact(&key)? {
+                        count += 1;
+                        total_before += before;
+                        total_after += after;
+                    }
+                }
+            }
+        }
+
+        Ok((count, total_before, total_after))
     }
 
     /// Compact only documents exceeding a size threshold.
@@ -1422,7 +1464,11 @@ mod tests {
     fn test_compact_in_memory_store() {
         let store = Arc::new(AutomergeStore::in_memory());
 
-        // Create a document and update it many times
+        // Create a document with multi-actor history to exercise compaction.
+        // fork() discards the change log (individual ops from each actor),
+        // which is where real savings come from in multi-peer CRDT sync.
+        // Single-actor docs may not shrink much since the compressed binary
+        // format is already efficient.
         let mut doc = Automerge::new();
         for i in 0..100 {
             doc.transact::<_, _, automerge::AutomergeError>(|tx| {
@@ -1432,16 +1478,39 @@ mod tests {
             .unwrap();
         }
 
+        // Simulate a second actor merging in (this is the pattern that
+        // causes history bloat in production — many peers contributing changes)
+        let mut doc2 = doc.fork();
+        for i in 0..100 {
+            doc2.transact::<_, _, automerge::AutomergeError>(|tx| {
+                tx.put(automerge::ROOT, "peer2_counter", i as i64)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        doc.merge(&mut doc2).unwrap();
+
         store.put("test-doc", &doc).unwrap();
 
-        // Compact should work in memory mode too
         let result = store.compact("test-doc").unwrap();
         assert!(result.is_some());
+        let (old_size, new_size) = result.unwrap();
+        assert!(
+            new_size <= old_size,
+            "compaction should not increase size, got {} -> {}",
+            old_size,
+            new_size
+        );
 
-        // Verify value is preserved
+        // Verify both actor values are preserved
         let loaded = store.get("test-doc").unwrap().unwrap();
-        let value = loaded.get(automerge::ROOT, "counter").unwrap().unwrap();
-        assert_eq!(value.0.to_i64(), Some(99));
+        let counter = loaded.get(automerge::ROOT, "counter").unwrap().unwrap();
+        assert_eq!(counter.0.to_i64(), Some(99));
+        let peer2 = loaded
+            .get(automerge::ROOT, "peer2_counter")
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer2.0.to_i64(), Some(99));
     }
 
     #[test]
@@ -1458,7 +1527,7 @@ mod tests {
             .unwrap();
         store.put("small-doc", &small_doc).unwrap();
 
-        // Create a large document with lots of history
+        // Create a large document with multi-actor history
         let mut big_doc = Automerge::new();
         for i in 0..200 {
             big_doc
@@ -1468,7 +1537,17 @@ mod tests {
                 })
                 .unwrap();
         }
-        let big_size = big_doc.save().len();
+        // Add a second actor to simulate peer sync history
+        let mut big_doc2 = big_doc.fork();
+        for i in 0..200 {
+            big_doc2
+                .transact::<_, _, automerge::AutomergeError>(|tx| {
+                    tx.put(automerge::ROOT, "peer2", i as i64)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        big_doc.merge(&mut big_doc2).unwrap();
         store.put("big-doc", &big_doc).unwrap();
 
         // Compact with threshold above small doc size but below big doc
@@ -1478,7 +1557,12 @@ mod tests {
 
         // Only the big doc should have been compacted (small is below threshold)
         assert_eq!(count, 1);
-        assert!(before >= after, "compaction should not increase size");
+        assert!(
+            after <= before,
+            "compaction should not increase size, got {} -> {}",
+            before,
+            after
+        );
 
         // Verify the big doc value is preserved
         let loaded = store.get("big-doc").unwrap().unwrap();
@@ -1494,6 +1578,7 @@ mod tests {
         store.start_background_compaction(
             std::time::Duration::from_millis(50),
             1024,
+            vec!["test".to_string()],
             token.clone(),
         );
 
@@ -1503,5 +1588,74 @@ mod tests {
         // Cancel and verify it stops (no panic, no hang)
         token.cancel();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[test]
+    fn test_compact_collections_above_threshold() {
+        let store = Arc::new(AutomergeStore::in_memory());
+
+        // Create docs in two collections
+        let mut beacons_doc = Automerge::new();
+        for i in 0..100 {
+            beacons_doc
+                .transact::<_, _, automerge::AutomergeError>(|tx| {
+                    tx.put(automerge::ROOT, "lat", i as i64)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        store.put("beacons:beacon-1", &beacons_doc).unwrap();
+
+        let mut commands_doc = Automerge::new();
+        for i in 0..100 {
+            commands_doc
+                .transact::<_, _, automerge::AutomergeError>(|tx| {
+                    tx.put(automerge::ROOT, "cmd", i as i64)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        store.put("commands:cmd-1", &commands_doc).unwrap();
+
+        let before_beacons = store.document_size("beacons:beacon-1").unwrap().unwrap();
+        let before_commands = store.document_size("commands:cmd-1").unwrap().unwrap();
+
+        // Only compact beacons collection
+        let (count, _, _) = store
+            .compact_collections_above_threshold(&["beacons".to_string()], 1)
+            .unwrap();
+
+        assert_eq!(count, 1, "only the beacons doc should be compacted");
+
+        // Commands doc should be unchanged
+        let after_commands = store.document_size("commands:cmd-1").unwrap().unwrap();
+        assert_eq!(
+            before_commands, after_commands,
+            "commands doc should not be touched"
+        );
+    }
+
+    #[test]
+    fn test_compact_collections_respects_threshold() {
+        let store = Arc::new(AutomergeStore::in_memory());
+
+        // Create a small doc in an opted-in collection
+        let mut small_doc = Automerge::new();
+        small_doc
+            .transact::<_, _, automerge::AutomergeError>(|tx| {
+                tx.put(automerge::ROOT, "key", "value")?;
+                Ok(())
+            })
+            .unwrap();
+        store.put("beacons:small", &small_doc).unwrap();
+
+        let size = store.document_size("beacons:small").unwrap().unwrap();
+
+        // Compact with threshold above the doc size
+        let (count, _, _) = store
+            .compact_collections_above_threshold(&["beacons".to_string()], size + 1)
+            .unwrap();
+
+        assert_eq!(count, 0, "small doc below threshold should be skipped");
     }
 }

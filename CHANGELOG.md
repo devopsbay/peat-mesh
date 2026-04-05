@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Per-collection, sync-mode-aware Automerge CRDT compaction to prevent
+  unbounded memory growth on long-running nodes and mobile devices (peat#760).
+  Compaction only runs on `LatestOnly` sync-mode collections, preserving
+  change history needed for delta sync on `FullHistory` collections.
+  Disabled by default; enable with `PEAT_COMPACTION_ENABLED=true`.
+
 ## [0.8.1] - 2026-04-03
 
 ### Fixed
