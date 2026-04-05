@@ -9,6 +9,7 @@ use crate::storage::ttl_manager::TtlManager;
 use automerge::{transaction::Transactable, Automerge, ReadDoc};
 use lru::LruCache;
 use redb::{Builder, Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -47,6 +48,11 @@ const TOMBSTONES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("to
 /// For high-throughput testing, the store can operate in pure in-memory mode
 /// where all documents are stored only in the LRU cache (no disk persistence).
 /// Enable via `AutomergeStore::in_memory()` constructor.
+/// Number of striped lock buckets for per-document concurrency control.
+/// Documents are hashed into buckets, so operations on different documents
+/// rarely contend while operations on the same document serialize correctly.
+const DOC_LOCK_STRIPES: usize = 64;
+
 pub struct AutomergeStore {
     /// Database handle - None when running in memory-only mode
     db: Option<Arc<Database>>,
@@ -57,6 +63,10 @@ pub struct AutomergeStore {
     /// Broadcast channel for observers - used for hierarchical aggregation (Issue #377)
     /// Notified for ALL document changes (local and synced) so observers can react
     observer_tx: broadcast::Sender<String>,
+    /// Striped locks for per-document concurrency control (Issue #74).
+    /// Serializes read-modify-write operations (compact, merge) on the
+    /// same document key to prevent silent data loss.
+    doc_locks: Box<[std::sync::Mutex<()>]>,
 }
 
 impl AutomergeStore {
@@ -133,6 +143,10 @@ impl AutomergeStore {
             cache: Arc::new(RwLock::new(cache)),
             change_tx,
             observer_tx,
+            doc_locks: (0..DOC_LOCK_STRIPES)
+                .map(|_| std::sync::Mutex::new(()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         })
     }
 
@@ -156,7 +170,28 @@ impl AutomergeStore {
             cache: Arc::new(RwLock::new(cache)),
             change_tx,
             observer_tx,
+            doc_locks: (0..DOC_LOCK_STRIPES)
+                .map(|_| std::sync::Mutex::new(()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
+    }
+
+    /// Acquire the striped lock for a document key.
+    ///
+    /// Returns a `MutexGuard` that serializes read-modify-write operations
+    /// on documents hashing to the same stripe. Hold this guard across
+    /// the entire get→modify→put sequence.
+    ///
+    /// Used by `compact()` and `AutomergeSyncCoordinator::receive_sync_message()`
+    /// to prevent concurrent modifications from silently dropping changes.
+    pub fn lock_doc(&self, key: &str) -> std::sync::MutexGuard<'_, ()> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % DOC_LOCK_STRIPES;
+        self.doc_locks[idx]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Check if the store is running in memory-only mode
@@ -691,12 +726,9 @@ impl AutomergeStore {
     /// }
     /// ```
     pub fn compact(&self, key: &str) -> Result<Option<(usize, usize)>> {
-        // NOTE: This is a non-atomic read-modify-write. If a concurrent
-        // receive_sync_message() applies changes between get() and
-        // put_without_notify(), those changes will be silently dropped.
-        // The 5-minute default interval makes this window narrow, and
-        // lost changes will be re-synced on the next polling round (5s).
-        // See: https://github.com/defenseunicorns/peat-mesh/issues/74
+        // Hold per-document striped lock across the entire get→fork→put
+        // sequence to prevent concurrent sync writes from being lost (Issue #74).
+        let _guard = self.lock_doc(key);
         let doc = match self.get(key)? {
             Some(d) => d,
             None => return Ok(None),

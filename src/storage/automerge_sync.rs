@@ -1095,45 +1095,45 @@ impl AutomergeSyncCoordinator {
             message_size
         );
 
-        // Get the document (or create empty one if doesn't exist)
-        let mut doc = self.store.get(doc_key)?.unwrap_or_else(Automerge::new);
-        let doc_len_before = doc.save().len();
+        // Hold per-document lock across the get→apply→put sequence to prevent
+        // compact() from overwriting concurrent sync changes (Issue #74).
+        // Lock is released before the async send to avoid holding across .await.
+        let response = {
+            let _guard = self.store.lock_doc(doc_key);
 
-        // Get or create sync state for this peer
-        let mut sync_state = self.get_or_create_sync_state(doc_key, peer_id);
+            let mut doc = self.store.get(doc_key)?.unwrap_or_else(Automerge::new);
+            let doc_len_before = doc.save().len();
 
-        // Apply the sync message using SyncDoc trait
-        SyncDoc::receive_sync_message(&mut doc, &mut sync_state, message)?;
+            let mut sync_state = self.get_or_create_sync_state(doc_key, peer_id);
 
-        let doc_len_after = doc.save().len();
-        tracing::debug!(
-            "receive_sync_message: doc {} size changed from {} to {} bytes",
-            doc_key,
-            doc_len_before,
-            doc_len_after
-        );
+            SyncDoc::receive_sync_message(&mut doc, &mut sync_state, message)?;
 
-        // Save updated document - this triggers change notification
-        // The flow control cooldown (per peer+doc) will correctly prevent
-        // syncing back to the peer that just sent us this document,
-        // while still allowing sync to other peers and notifying observers.
-        self.put_with_ttl(doc_key, &doc)?;
+            let doc_len_after = doc.save().len();
+            tracing::debug!(
+                "receive_sync_message: doc {} size changed from {} to {} bytes",
+                doc_key,
+                doc_len_before,
+                doc_len_after
+            );
 
-        // Generate response message
-        if let Some(response) = SyncDoc::generate_sync_message(&doc, &mut sync_state) {
-            // Store updated sync state
-            self.update_sync_state(doc_key, peer_id, sync_state);
+            self.put_with_ttl(doc_key, &doc)?;
 
-            // Send response to peer with document key
+            let response = SyncDoc::generate_sync_message(&doc, &mut sync_state);
+            if response.is_some() {
+                self.update_sync_state(doc_key, peer_id, sync_state);
+            } else {
+                // Sync converged - reset state to prevent memory accumulation (Issue #435)
+                let mut fresh_state = SyncState::new();
+                fresh_state.shared_heads = sync_state.shared_heads;
+                self.update_sync_state(doc_key, peer_id, fresh_state);
+            }
+            response
+        };
+        // _guard dropped here — lock released before network I/O
+
+        if let Some(response) = response {
             self.send_sync_message_for_doc(peer_id, doc_key, &response)
                 .await?;
-        } else {
-            // Sync converged - reset state to prevent memory accumulation (Issue #435)
-            // Only preserve shared_heads (what both peers have), discard session data
-            // like sent_hashes which accumulates unboundedly during sync rounds.
-            let mut fresh_state = SyncState::new();
-            fresh_state.shared_heads = sync_state.shared_heads;
-            self.update_sync_state(doc_key, peer_id, fresh_state);
         }
 
         Ok(())
@@ -2338,34 +2338,31 @@ impl AutomergeSyncCoordinator {
         let received_doc =
             Automerge::load(&state_bytes).context("Failed to load state snapshot")?;
 
-        // Check if we have an existing document
-        let mut received_doc = received_doc;
-        match self.store.get(doc_key) {
-            Ok(Some(mut existing_doc)) => {
-                // Merge the received state into our existing document
-                // This handles the case where both sides have made changes
-                existing_doc
-                    .merge(&mut received_doc)
-                    .context("Failed to merge state snapshot")?;
+        // Hold per-document lock across the get→merge→put sequence (Issue #74).
+        {
+            let _guard = self.store.lock_doc(doc_key);
 
-                // Update the store (this triggers change notification via broadcast channel)
-                self.put_with_ttl(doc_key, &existing_doc)?;
-
-                tracing::debug!("Merged state snapshot into existing document {}", doc_key);
-            }
-            Ok(None) => {
-                // No existing document, just store the received one
-                self.put_with_ttl(doc_key, &received_doc)?;
-
-                tracing::debug!("Stored new document {} from state snapshot", doc_key);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Error checking existing document {}: {}, storing received state",
-                    doc_key,
-                    e
-                );
-                self.put_with_ttl(doc_key, &received_doc)?;
+            let mut received_doc = received_doc;
+            match self.store.get(doc_key) {
+                Ok(Some(mut existing_doc)) => {
+                    existing_doc
+                        .merge(&mut received_doc)
+                        .context("Failed to merge state snapshot")?;
+                    self.put_with_ttl(doc_key, &existing_doc)?;
+                    tracing::debug!("Merged state snapshot into existing document {}", doc_key);
+                }
+                Ok(None) => {
+                    self.put_with_ttl(doc_key, &received_doc)?;
+                    tracing::debug!("Stored new document {} from state snapshot", doc_key);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Error checking existing document {}: {}, storing received state",
+                        doc_key,
+                        e
+                    );
+                    self.put_with_ttl(doc_key, &received_doc)?;
+                }
             }
         }
 
