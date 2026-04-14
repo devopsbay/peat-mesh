@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
+# Cargo.lock is optional (not always committed for libraries)
+COPY Cargo.lock* ./
 COPY .cargo .cargo
 
 # Create dummy sources to cache dependencies
