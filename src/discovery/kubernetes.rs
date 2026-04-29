@@ -104,6 +104,42 @@ impl KubernetesDiscovery {
         }
     }
 
+    /// Pick the transport port to advertise for discovered peers.
+    ///
+    /// peat-mesh-node exposes both the broker HTTP port and the Iroh QUIC port
+    /// in a single Service. For peer-to-peer sync we must prefer the `iroh-quic`
+    /// UDP port instead of whichever port happens to come first.
+    fn select_port(ports: &Option<Vec<k8s_openapi::api::discovery::v1::EndpointPort>>) -> u16 {
+        let Some(ports) = ports.as_ref() else {
+            return 8080;
+        };
+
+        if let Some(port) = ports.iter().find_map(|p| {
+            if p.name.as_deref() == Some("iroh-quic") {
+                p.port.map(|v| v as u16)
+            } else {
+                None
+            }
+        }) {
+            return port;
+        }
+
+        if let Some(port) = ports.iter().find_map(|p| {
+            if p.protocol.as_deref() == Some("UDP") {
+                p.port.map(|v| v as u16)
+            } else {
+                None
+            }
+        }) {
+            return port;
+        }
+
+        ports
+            .first()
+            .and_then(|p| p.port)
+            .unwrap_or(8080) as u16
+    }
+
     /// Extract PeerInfo from an EndpointSlice's endpoints.
     pub fn extract_peers_from_endpoint_slice(
         endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
@@ -136,12 +172,7 @@ impl KubernetesDiscovery {
                 });
 
             // Parse addresses into SocketAddr (using port from the slice's ports)
-            let port: u16 = endpoint_slice
-                .ports
-                .as_ref()
-                .and_then(|ports| ports.first())
-                .and_then(|p| p.port)
-                .unwrap_or(8080) as u16;
+            let port = Self::select_port(&endpoint_slice.ports);
 
             let socket_addrs: Vec<std::net::SocketAddr> = addresses
                 .iter()

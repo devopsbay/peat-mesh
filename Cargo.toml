@@ -103,6 +103,9 @@ broker = ["axum", "tower", "tower-http"]
 kubernetes = ["kube", "k8s-openapi", "rustls"]
 node = ["automerge-backend", "broker", "kubernetes", "k8s-openapi/v1_32", "tracing-subscriber", "lite-bridge"]
 
+[patch.crates-io]
+ed25519-dalek = { path = "vendor/ed25519-dalek" }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -112,4 +115,3 @@ http-body-util = "0.1"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 k8s-openapi = { version = "0.24", features = ["v1_32"] }
-

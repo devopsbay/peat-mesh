@@ -15,6 +15,7 @@ COPY Cargo.toml ./
 # Cargo.lock is optional (not always committed for libraries)
 COPY Cargo.lock* ./
 COPY .cargo .cargo
+COPY vendor vendor
 
 # Create dummy sources to cache dependencies
 RUN mkdir -p src/bin examples && \

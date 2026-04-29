@@ -45,6 +45,16 @@ impl FormationPeerSet {
             .unwrap_or_else(|e| e.into_inner())
             .contains(peer)
     }
+
+    /// Return a point-in-time snapshot of all known formation peers.
+    pub fn snapshot(&self) -> Vec<EndpointId> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect()
+    }
 }
 
 impl Default for FormationPeerSet {
