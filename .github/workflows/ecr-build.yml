@@ -1,0 +1,46 @@
+name: Build & Push to ECR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: meta
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "tag=${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/Github-ECR-Builder
+          role-session-name: PeatMeshBuild
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          ECR="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          aws ecr get-login-password --region "${{ secrets.AWS_REGION }}" | \
+            docker login --username AWS --password-stdin "$ECR"
+          echo "ECR_REGISTRY=$ECR" >> "$GITHUB_ENV"
+
+      - name: Build and push
+        run: |
+          IMAGE="${ECR_REGISTRY}/trop/peat-mesh:${{ steps.meta.outputs.tag }}"
+          docker build --platform linux/amd64 -f deploy/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "Pushed: $IMAGE"
