@@ -9,6 +9,10 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_ACCOUNT_ID: "573094846563"
+  AWS_REGION: eu-west-1
+
 jobs:
   build:
     name: Build & Push
@@ -27,14 +31,14 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/Github-ECR-Builder
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/Github-ECR-Builder
           role-session-name: PeatMeshBuild
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
         run: |
-          ECR="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-          aws ecr get-login-password --region "${{ secrets.AWS_REGION }}" | \
+          ECR="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "${AWS_REGION}" | \
             docker login --username AWS --password-stdin "$ECR"
           echo "ECR_REGISTRY=$ECR" >> "$GITHUB_ENV"
 
