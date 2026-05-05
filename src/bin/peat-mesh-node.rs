@@ -24,7 +24,77 @@ use peat_mesh::transport::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+
+struct NodeBrokerState {
+    node_id: String,
+    version: String,
+    started_at: Instant,
+    transport: Arc<MeshSyncTransport>,
+    event_tx: broadcast::Sender<peat_mesh::broker::state::MeshEvent>,
+}
+
+#[async_trait::async_trait]
+impl peat_mesh::broker::state::MeshBrokerState for NodeBrokerState {
+    fn node_info(&self) -> peat_mesh::broker::state::MeshNodeInfo {
+        peat_mesh::broker::state::MeshNodeInfo {
+            node_id: self.node_id.clone(),
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            version: self.version.clone(),
+        }
+    }
+
+    async fn list_peers(&self) -> Vec<peat_mesh::broker::state::PeerSummary> {
+        self.transport
+            .connected_peers()
+            .into_iter()
+            .map(|peer_id| peat_mesh::broker::state::PeerSummary {
+                id: peer_id.to_string(),
+                connected: true,
+                state: "active".to_string(),
+                rtt_ms: self
+                    .transport
+                    .peer_rtt(&peer_id)
+                    .map(|rtt| rtt.as_millis() as u64),
+            })
+            .collect()
+    }
+
+    async fn get_peer(&self, id: &str) -> Option<peat_mesh::broker::state::PeerSummary> {
+        self.transport
+            .connected_peers()
+            .into_iter()
+            .find(|existing| existing.to_string() == id)
+            .map(|peer_id| peat_mesh::broker::state::PeerSummary {
+                id: peer_id.to_string(),
+                connected: true,
+                state: "active".to_string(),
+                rtt_ms: self
+                    .transport
+                    .peer_rtt(&peer_id)
+                    .map(|rtt| rtt.as_millis() as u64),
+            })
+    }
+
+    fn topology(&self) -> peat_mesh::broker::state::TopologySummary {
+        let peer_count = self.transport.connected_peers().len();
+        peat_mesh::broker::state::TopologySummary {
+            peer_count,
+            role: if peer_count > 0 {
+                "connected".to_string()
+            } else {
+                "standalone".to_string()
+            },
+            hierarchy_level: 0,
+        }
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<peat_mesh::broker::state::MeshEvent> {
+        self.event_tx.subscribe()
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     // Install rustls crypto provider (required by kube's rustls-tls)
@@ -150,10 +220,30 @@ async fn run() -> anyhow::Result<()> {
     let mut discovery: Box<dyn peat_mesh::discovery::DiscoveryStrategy> =
         match discovery_mode.as_str() {
             "kubernetes" | "k8s" => {
-                info!("Using Kubernetes EndpointSlice discovery");
-                Box::new(KubernetesDiscovery::new(
-                    KubernetesDiscoveryConfig::default(),
-                ))
+                let k8s_namespace = std::env::var("PEAT_K8S_NAMESPACE").ok();
+                let k8s_label_selector = std::env::var("PEAT_K8S_LABEL_SELECTOR")
+                    .unwrap_or_else(|_| KubernetesDiscoveryConfig::default().label_selector);
+                let k8s_annotation_prefix = std::env::var("PEAT_K8S_ANNOTATION_PREFIX")
+                    .unwrap_or_else(|_| KubernetesDiscoveryConfig::default().annotation_prefix);
+                let k8s_poll_interval = std::env::var("PEAT_K8S_POLL_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or_else(|| KubernetesDiscoveryConfig::default().poll_interval);
+
+                info!(
+                    namespace = ?k8s_namespace,
+                    label_selector = %k8s_label_selector,
+                    annotation_prefix = %k8s_annotation_prefix,
+                    poll_interval_secs = k8s_poll_interval.as_secs(),
+                    "Using Kubernetes EndpointSlice discovery"
+                );
+                Box::new(KubernetesDiscovery::new(KubernetesDiscoveryConfig {
+                    namespace: k8s_namespace,
+                    label_selector: k8s_label_selector,
+                    annotation_prefix: k8s_annotation_prefix,
+                    poll_interval: k8s_poll_interval,
+                }))
             }
             "mdns" => {
                 info!("Using mDNS discovery");
@@ -465,12 +555,14 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ── Build mesh ───────────────────────────────────────────────
-    let mesh = PeatMeshBuilder::new(mesh_config)
-        .with_device_keypair_from_seed(&seed, &hostname)
-        .map_err(|e| anyhow::anyhow!("Keypair derivation failed: {}", e))?
-        .with_formation_key(formation_key)
-        .with_discovery(discovery)
-        .build();
+    let mesh = Arc::new(
+        PeatMeshBuilder::new(mesh_config)
+            .with_device_keypair_from_seed(&seed, &hostname)
+            .map_err(|e| anyhow::anyhow!("Keypair derivation failed: {}", e))?
+            .with_formation_key(formation_key)
+            .with_discovery(discovery)
+            .build(),
+    );
 
     mesh.start()
         .map_err(|e| anyhow::anyhow!("Failed to start mesh: {}", e))?;
@@ -506,6 +598,7 @@ async fn run() -> anyhow::Result<()> {
         let coordinator = coordinator.clone();
         let transport = sync_transport.clone();
         let ttl_for_sync = ttl_manager.clone();
+        let formation_peers_for_sync = formation_peers.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -517,6 +610,32 @@ async fn run() -> anyhow::Result<()> {
                         break;
                     }
                 }
+                // Bootstrap sync connections from discovered formation members.
+                for peer_id in formation_peers_for_sync.snapshot() {
+                    if peer_id == transport.endpoint().id() {
+                        continue;
+                    }
+                    if transport.get_connection(&peer_id).is_some() {
+                        continue;
+                    }
+                    match transport.connect_and_authenticate(peer_id).await {
+                        Ok(conn) => {
+                            transport.start_sync_connection(conn, coordinator.clone());
+                            info!(
+                                peer = %peer_id.fmt_short(),
+                                "Bootstrapped sync connection to discovered formation peer"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                peer = %peer_id.fmt_short(),
+                                error = %e,
+                                "Failed to bootstrap sync connection to discovered formation peer"
+                            );
+                        }
+                    }
+                }
+
                 let peers = transport.connected_peers();
                 // When offline (no peers), extend TTLs to prevent premature eviction
                 if peers.is_empty() {
@@ -628,14 +747,21 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Broker HTTP server ───────────────────────────────────────
-    let mesh = Arc::new(mesh);
     let broker_config = BrokerConfig {
         bind_addr: SocketAddr::from(([0, 0, 0, 0], broker_port)),
         ..Default::default()
     };
     let store_adapter = peat_mesh::broker::StoreBrokerAdapter::new(automerge_store.clone());
+    let (broker_event_tx, _) = broadcast::channel(256);
+    let node_state = Arc::new(NodeBrokerState {
+        node_id: hostname.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: Instant::now(),
+        transport: sync_transport.clone(),
+        event_tx: broker_event_tx,
+    });
     let composite_state = Arc::new(peat_mesh::broker::CompositeBrokerState::new(
-        mesh.clone() as Arc<dyn peat_mesh::broker::state::MeshBrokerState>,
+        node_state as Arc<dyn peat_mesh::broker::state::MeshBrokerState>,
         store_adapter,
     ));
 

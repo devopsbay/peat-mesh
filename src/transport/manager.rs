@@ -718,7 +718,7 @@ impl TransportManager {
             .collect();
 
         let mut sorted: Vec<_> = candidates;
-        sorted.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by score
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1)); // Sort descending by score
 
         if sorted.is_empty() {
             return Err(TransportError::PeerNotFound(format!(

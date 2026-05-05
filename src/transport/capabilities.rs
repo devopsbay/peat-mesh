@@ -242,11 +242,9 @@ impl TransportCapabilities {
 
     /// Estimate delivery time for a message of given size
     pub fn estimate_delivery_ms(&self, message_size: usize) -> u32 {
-        let transfer_time = if self.max_bandwidth_bps > 0 {
-            (message_size as u64 * 1000 / self.max_bandwidth_bps) as u32
-        } else {
-            0
-        };
+        let transfer_time = (message_size as u64 * 1000)
+            .checked_div(self.max_bandwidth_bps)
+            .unwrap_or(0) as u32;
         self.typical_latency_ms + transfer_time
     }
 }
