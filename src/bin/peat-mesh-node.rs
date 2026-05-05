@@ -54,7 +54,10 @@ impl peat_mesh::broker::state::MeshBrokerState for NodeBrokerState {
                 id: peer_id.to_string(),
                 connected: true,
                 state: "active".to_string(),
-                rtt_ms: self.transport.peer_rtt(&peer_id).map(|rtt| rtt.as_millis() as u64),
+                rtt_ms: self
+                    .transport
+                    .peer_rtt(&peer_id)
+                    .map(|rtt| rtt.as_millis() as u64),
             })
             .collect()
     }
@@ -68,7 +71,10 @@ impl peat_mesh::broker::state::MeshBrokerState for NodeBrokerState {
                 id: peer_id.to_string(),
                 connected: true,
                 state: "active".to_string(),
-                rtt_ms: self.transport.peer_rtt(&peer_id).map(|rtt| rtt.as_millis() as u64),
+                rtt_ms: self
+                    .transport
+                    .peer_rtt(&peer_id)
+                    .map(|rtt| rtt.as_millis() as u64),
             })
     }
 
@@ -218,9 +224,7 @@ async fn run() -> anyhow::Result<()> {
                 let k8s_label_selector = std::env::var("PEAT_K8S_LABEL_SELECTOR")
                     .unwrap_or_else(|_| KubernetesDiscoveryConfig::default().label_selector);
                 let k8s_annotation_prefix = std::env::var("PEAT_K8S_ANNOTATION_PREFIX")
-                    .unwrap_or_else(|_| {
-                        KubernetesDiscoveryConfig::default().annotation_prefix
-                    });
+                    .unwrap_or_else(|_| KubernetesDiscoveryConfig::default().annotation_prefix);
                 let k8s_poll_interval = std::env::var("PEAT_K8S_POLL_INTERVAL_SECS")
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
@@ -551,12 +555,14 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ── Build mesh ───────────────────────────────────────────────
-    let mesh = Arc::new(PeatMeshBuilder::new(mesh_config)
-        .with_device_keypair_from_seed(&seed, &hostname)
-        .map_err(|e| anyhow::anyhow!("Keypair derivation failed: {}", e))?
-        .with_formation_key(formation_key)
-        .with_discovery(discovery)
-        .build());
+    let mesh = Arc::new(
+        PeatMeshBuilder::new(mesh_config)
+            .with_device_keypair_from_seed(&seed, &hostname)
+            .map_err(|e| anyhow::anyhow!("Keypair derivation failed: {}", e))?
+            .with_formation_key(formation_key)
+            .with_discovery(discovery)
+            .build(),
+    );
 
     mesh.start()
         .map_err(|e| anyhow::anyhow!("Failed to start mesh: {}", e))?;

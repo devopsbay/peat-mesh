@@ -134,10 +134,7 @@ impl KubernetesDiscovery {
             return port;
         }
 
-        ports
-            .first()
-            .and_then(|p| p.port)
-            .unwrap_or(8080) as u16
+        ports.first().and_then(|p| p.port).unwrap_or(8080) as u16
     }
 
     /// Extract PeerInfo from an EndpointSlice's endpoints.
